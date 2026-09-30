@@ -1041,6 +1041,9 @@ OpenCode-managed connections use a 75-second client deadline so its tool call
 can receive the result of Paperclip's maximum 60-second gateway wait.
 Its managed MCP endpoints are reasserted through a final file-backed per-run
 config layer, so a home OpenCode config cannot redirect a managed bearer.
+For permissions-enforced SSH runs, this layer preserves the remote user's
+OpenCode provider and permission config while reading managed endpoints and
+bearers from private per-run files.
 
 Responses may contain secret IDs, version selectors, header names, prefixes,
 scope names, expiry timestamps, and redacted provider metadata. They must not

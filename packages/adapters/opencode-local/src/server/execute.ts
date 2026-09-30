@@ -608,7 +608,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runId, target: executionTarget, configDir: remoteConfigDir,
         action: "harden", cwd, timeoutSec, graceSec,
       });
-      preparedRuntimeConfig.env.XDG_CONFIG_HOME = remoteConfigDir;
+      // A permissions-enforced SSH run may rely on provider and permission
+      // settings in the remote user's own XDG config. The final MCP overlay
+      // reads its sidecars by absolute path, so it does not need to replace
+      // that config. Keep the staged XDG home only when this run already used
+      // it for Paperclip's runtime config or managed provider authentication.
+      if (localRuntimeConfigHome || config.managedAiConnection) {
+        preparedRuntimeConfig.env.XDG_CONFIG_HOME = remoteConfigDir;
+      }
       if (!bearerConfig.managedMcpOverlayContentForHome) {
         throw new Error("OpenCode managed MCP overlay was not prepared.");
       }

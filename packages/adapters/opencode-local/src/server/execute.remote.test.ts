@@ -438,6 +438,13 @@ describe("opencode remote execution", () => {
       | [string, string, string[], { env: Record<string, string> }]
       | undefined;
     const remoteOverlay = JSON.parse(invocation?.[3].env.OPENCODE_CONFIG_CONTENT ?? "null");
+    // The managed overlay reads its private sidecars directly. It must not
+    // replace a permissions-enforced SSH user's native provider/deny config.
+    expect(invocation?.[3].env.XDG_CONFIG_HOME).toBeUndefined();
+    const modelProbe = runChildProcess.mock.calls.find((call) => call[2]?.includes("models")) as unknown as
+      | [string, string, string[], { env: Record<string, string> }]
+      | undefined;
+    expect(modelProbe?.[3].env.XDG_CONFIG_HOME).toBeUndefined();
     expect(remoteOverlay.mcp.research.url).toMatch(
       new RegExp(`^\\{file:${configDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/opencode/paperclip-managed-mcp-[a-f0-9-]+\\.url\\}$`),
     );
