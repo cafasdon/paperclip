@@ -10,10 +10,12 @@ describe('GitHub skill repository discovery', () => {
   it('streams real audited package metadata and file counts before returning the complete scan', async () => {
     const events: SkillSourceScanUpdate[] = [];
     const fixture = githubFixture({ 'one/SKILL.md': md('one'), 'one/scripts/help.sh': 'echo private-package-content', 'two/SKILL.md': md('two') });
-    const scan = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, async url => {
+    const controller = new AbortController();
+    const scan = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, async (url, signal) => {
+      expect(signal).toBe(controller.signal);
       if (url.endsWith('/blobs/2')) expect(events).toContainEqual(expect.objectContaining({ type: 'candidate', candidate: expect.objectContaining({ name: 'one' }) }));
       return fixture(url);
-    }, { onProgress: event => { events.push(event); } });
+    }, { signal: controller.signal, onProgress: event => { events.push(event); } });
     expect(scan.candidates).toHaveLength(2);
     expect(events[0]).toMatchObject({ phase: 'connecting', totalSkills: null });
     expect(events).toContainEqual(expect.objectContaining({ phase: 'checking', totalSkills: 2, checkedSkills: 0, checkedFiles: 1, totalFiles: 2, currentPath: 'one/scripts/help.sh' }));

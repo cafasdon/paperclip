@@ -6,7 +6,7 @@ import { assertSkillSnapshotPath, snapshotFile, skillFileBytes } from './skill-s
 import { inspectSkillPackage } from './skill-package-inspection.js';
 import { auditSkillSnapshot, classifyInventoryKind } from './company-skills.js';
 
-export type GitHubRead = (apiPath: string) => Promise<unknown>;
+export type GitHubRead = (apiPath: string, signal?: AbortSignal) => Promise<unknown>;
 type TreeEntry = { path: string; type: string; mode: string; sha: string; size?: number };
 export type DiscoveredSkill = SkillSourceCandidate & { files: CompanySkillVersionFileInventoryEntry[] };
 export type ScannedSkillSource = SkillSourceDiscovery & { skills: DiscoveredSkill[]; defaultBranch: string };
@@ -27,7 +27,7 @@ export interface SkillScanOptions {
 export async function scanGitHubSkills(input: { repositoryUrl: string; trackingRef?: string; commitSha?: string; onlySkillPath?: string }, providerRead: GitHubRead, options: SkillScanOptions = {}): Promise<ScannedSkillSource> {
   const read: GitHubRead = async apiPath => {
     options.signal?.throwIfAborted();
-    const result = await providerRead(apiPath);
+    const result = await providerRead(apiPath, options.signal);
     options.signal?.throwIfAborted();
     return result;
   };

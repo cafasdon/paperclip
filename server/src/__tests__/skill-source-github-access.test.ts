@@ -11,6 +11,33 @@ const db = {} as Db;
 beforeEach(() => { mocks.grantIds.mockResolvedValue(['grant']); });
 afterEach(() => { vi.unstubAllGlobals(); vi.resetAllMocks(); });
 describe('GitHub source authorization', () => {
+  it('aborts an in-flight GitHub fetch and does not fall through to another grant', async () => {
+    mocks.grantIds.mockResolvedValue(['first', 'second']);
+    mocks.headers.mockResolvedValue({ Authorization: 'Bearer allowed' });
+    const controller = new AbortController();
+    const fetch = vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+    }));
+    vi.stubGlobal('fetch', fetch);
+    const read = skillSourceGitHubReader(db, 'company', actor({ type: 'board', userId: 'alice' }), 'connection');
+    const request = read('/repos/acme/private', controller.signal);
+    const rejected = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    controller.abort();
+    await rejected;
+    expect(fetch.mock.calls[0]![1].signal!.aborted).toBe(true);
+    expect(mocks.headers).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it('does not start a fetch if cancelled during credential resolution', async () => {
+    const controller = new AbortController();
+    mocks.headers.mockImplementation(async () => { controller.abort(); return { Authorization: 'Bearer allowed' }; });
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    const read = skillSourceGitHubReader(db, 'company', actor({ type: 'board', userId: 'alice' }), 'connection');
+    await expect(read('/repos/acme/private', controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('reads public repositories anonymously without resolving a token', async () => {
     const fetch = vi.fn().mockResolvedValue(Response.json({ id: 1 })); vi.stubGlobal('fetch', fetch);
     const read = skillSourceGitHubReader(db, 'company', actor({ type: 'board', userId: 'alice', source: 'session' }), null);

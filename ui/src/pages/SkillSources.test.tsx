@@ -80,6 +80,21 @@ describe('GitHub skill source import', () => {
     expect(document.body.textContent).not.toContain('Code review');
     expect(button('Find skills').disabled).toBe(false);
   });
+  it('bounds the live feed while keeping the full server progress count', async () => {
+    vi.mocked(skillSourcesApi.discoverStream).mockImplementation((_company, _input, update, signal) => {
+      for (let index = 0; index < 40; index++) update({ type: 'candidate', candidate: { path: `${index}/SKILL.md`, name: `Skill ${index}`, description: null, fileCount: 1, error: null } });
+      update({ type: 'progress', phase: 'checking', totalSkills: 100, checkedSkills: 40, currentPath: '40/SKILL.md', checkedFiles: 0, totalFiles: 1 });
+      return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    });
+    await mount();
+    await act(async () => (document.querySelector('[cmdk-item]') as HTMLElement).click());
+    await act(async () => button('Find skills').click()); await flush();
+    expect(document.querySelectorAll('[aria-label="Skills checked so far"] li')).toHaveLength(5);
+    expect(document.body.textContent).toContain('40 of 100 checked');
+    expect(document.body.textContent).toContain('40 checked');
+    expect(document.body.textContent).not.toContain('Skill 0');
+    expect(document.body.textContent).toContain('Skill 39');
+  });
   it('cancels a scan, preserves the repository, and ignores late progress and completion', async () => {
     let finish!: (result: typeof discovery) => void;
     let update!: Parameters<typeof skillSourcesApi.discoverStream>[2];

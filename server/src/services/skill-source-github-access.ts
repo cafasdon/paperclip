@@ -28,12 +28,19 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
       return toolAccessService(db).githubReadHeaders(companyId, connectionId, actor.userId ?? null, actor.source === 'local_implicit', force, grantId);
     })();
   };
-  return async (apiPath: string) => {
+  return async (apiPath: string, signal?: AbortSignal) => {
+    signal?.throwIfAborted();
     if (!apiPath.startsWith('/repos/') || apiPath.includes('://') || apiPath.startsWith('//')) throw unprocessable('Invalid GitHub repository request.');
-    const request = async (grantId: string | null | undefined, force = false) => fetch(`https://api.github.com${apiPath}`, {
-      headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...await headers(force, grantId) },
-      redirect: 'error', signal: AbortSignal.timeout(30_000),
-    });
+    const request = async (grantId: string | null | undefined, force = false) => {
+      signal?.throwIfAborted();
+      const authorization = await headers(force, grantId);
+      signal?.throwIfAborted();
+      const timeout = AbortSignal.timeout(30_000);
+      return fetch(`https://api.github.com${apiPath}`, {
+        headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...authorization },
+        redirect: 'error', signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
+    };
     let response: Response | undefined;
     let authorizationError: unknown;
     try {
@@ -46,11 +53,13 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
           if (response.status === 401 && connectionId && actor.type === 'board') response = await request(grantId, true);
           if (![401, 403, 404].includes(response.status)) break;
         } catch (error) {
+          signal?.throwIfAborted();
           authorizationError = error instanceof Error && 'status' in error ? error
             : unprocessable('Could not read GitHub. Check your connection and try again.');
         }
       }
     } catch (error) {
+      signal?.throwIfAborted();
       if (error instanceof Error && 'status' in error) throw error;
       throw unprocessable('Could not read GitHub. Check your connection and try again.');
     }

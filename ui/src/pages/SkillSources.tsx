@@ -131,7 +131,7 @@ function SourceDialog({ companyId, source, onClose, onSaved }: {
     const result = await skillSourcesApi.discoverStream(companyId, { repositoryUrl, connectionId: availableConnectionId }, event => {
       if (controller.signal.aborted || scanController.current !== controller) return;
       if (event.type === 'progress') setProgress(event);
-      else setFound(previous => [...previous.filter(skill => skill.path !== event.candidate.path), event.candidate]);
+      else setFound(previous => [...previous.filter(skill => skill.path !== event.candidate.path), event.candidate].slice(-5));
     }, controller.signal);
     return { discovery: result, connectionId: availableConnectionId, controller };
   }, onSuccess: result => {

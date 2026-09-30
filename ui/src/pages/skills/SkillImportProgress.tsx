@@ -46,7 +46,7 @@ export function SkillImportProgress({ repository, progress, found = [], importin
     <div className="overflow-hidden rounded-lg border border-border bg-muted/20">
       <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2 text-xs text-muted-foreground">
         <span>{importing ? 'Selected skills' : 'Recently checked'}</span>
-        {recent.length > 0 && <span className="tabular-nums">{importing ? `${count} selected` : `${found.length} checked`}</span>}
+        {recent.length > 0 && <span className="tabular-nums">{importing ? `${count} selected` : `${progress?.checkedSkills ?? found.length} checked`}</span>}
       </div>
       {recent.length > 0 ? <ul className="divide-y divide-border" aria-label={importing ? 'Skills being imported' : 'Skills checked so far'}>
         {recent.map(skill => <li key={skill.path} className="skill-import-enter flex min-w-0 items-center gap-2.5 px-3 py-2.5">
