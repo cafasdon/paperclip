@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -52,7 +52,7 @@ const {
     stderr: "",
     exitCode: 0,
   })),
-  syncDirectoryToSsh: vi.fn(async () => undefined),
+  syncDirectoryToSsh: vi.fn(async (_input?: { localDir: string; remoteDir: string }) => undefined),
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({
     env: {
       PAPERCLIP_API_URL: "http://127.0.0.1:4310",
@@ -397,5 +397,75 @@ describe("opencode remote execution", () => {
       | undefined;
     expect(call?.[2]).toContain("--session");
     expect(call?.[2]).toContain("session-123");
+  });
+
+  it("stages a bearer config for SSH and removes it after a remote process failure", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-mcp-remote-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const bearer = "remote-test-bearer";
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+    let stagedConfig: Record<string, unknown> | null = null;
+    syncDirectoryToSsh.mockImplementationOnce(async () => undefined)
+      .mockImplementationOnce(async (input) => {
+        stagedConfig = JSON.parse(await readFile(path.join(input!.localDir, "opencode", "opencode.json"), "utf8"));
+      });
+    runChildProcess.mockRejectedValueOnce(new Error("remote OpenCode failed"));
+    const configDir = "/remote/workspace/.paperclip-runtime/runs/run-mcp-ssh/workspace/.paperclip-runtime/opencode/xdgConfig";
+    await expect(execute({
+      runId: "run-mcp-ssh",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "opencode", model: "opencode/gpt-5-nano", dangerouslySkipPermissions: false,
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      runtimeMcp: { getServers: () => [{ name: "research", url: "https://mcp.example.test/mcp", token: bearer, connectionId: "connection-1" }] },
+      executionTransport: { remoteExecution: {
+        host: "127.0.0.1", port: 2222, username: "fixture",
+        remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+      } },
+      onLog: async (_stream, chunk) => { logs.push(chunk); },
+      onMeta: async (meta) => { metadata.push(meta); },
+    })).rejects.toThrow("remote OpenCode failed");
+    expect(stagedConfig).toMatchObject({ mcp: { research: {
+      type: "remote", headers: { Authorization: `Bearer ${bearer}` }, enabled: true, oauth: false,
+    } } });
+    expect(runSshCommand).toHaveBeenCalledWith(expect.anything(), expect.stringContaining(`chmod 600 '${configDir}/opencode/opencode.json'`), expect.anything());
+    expect(runSshCommand).toHaveBeenCalledWith(expect.anything(), expect.stringContaining(`rm -rf -- '${configDir}'`), expect.anything());
+    expect(JSON.stringify({ args: runChildProcess.mock.calls.map((call) => call[2]), logs, metadata })).not.toContain(bearer);
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalled();
+  });
+
+  it("removes a partially staged bearer config when SSH asset sync fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-mcp-stage-fail-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    syncDirectoryToSsh.mockImplementationOnce(async () => undefined)
+      .mockRejectedValueOnce(new Error("synthetic partial upload"));
+    await expect(execute({
+      runId: "run-mcp-stage-fail",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "opencode", model: "opencode/gpt-5-nano", dangerouslySkipPermissions: false,
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      runtimeMcp: { getServers: () => [{ name: "research", url: "https://mcp.example.test/mcp", token: "partial-bearer", connectionId: "connection-1" }] },
+      executionTransport: { remoteExecution: {
+        host: "127.0.0.1", port: 2222, username: "fixture",
+        remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+      } },
+      onLog: async () => {},
+    })).rejects.toThrow("synthetic partial upload");
+    expect(runSshCommand).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("rm -rf -- '/remote/workspace/.paperclip-runtime/runs/run-mcp-stage-fail/workspace/.paperclip-runtime/opencode/xdgConfig'"),
+      expect.anything(),
+    );
+    expect(runChildProcess).not.toHaveBeenCalled();
   });
 });

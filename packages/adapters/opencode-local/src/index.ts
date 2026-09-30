@@ -102,4 +102,8 @@ Notes:
 - When \`dangerouslySkipPermissions\` is enabled, Paperclip injects a temporary \
   runtime config with \`permission.external_directory=allow\` so headless runs do \
   not stall on approval prompts.
+- Paperclip-managed MCP servers are injected into a temporary OpenCode XDG config \
+  for each run, including when \`dangerouslySkipPermissions\` is false. The \
+  temporary config is removed after execution, and a changed MCP server set \
+  starts a fresh OpenCode session.
 `;
