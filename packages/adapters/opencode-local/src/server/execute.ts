@@ -93,8 +93,11 @@ async function runRemoteConfigCommand(input: {
   graceSec: number;
 }): Promise<void> {
   const configPath = path.posix.join(input.configDir, "opencode", "opencode.json");
+  const configFileDir = path.posix.dirname(configPath);
   const command = input.action === "harden"
-    ? `chmod 700 ${shellQuote(input.configDir)} ${shellQuote(path.posix.dirname(configPath))} && chmod 600 ${shellQuote(configPath)}`
+    ? `chmod 700 ${shellQuote(input.configDir)} ${shellQuote(configFileDir)} && ` +
+      `chmod 600 ${shellQuote(configPath)} && ` +
+      `find ${shellQuote(configFileDir)} -maxdepth 1 -type f -name 'paperclip-managed-mcp-*' -exec chmod 600 -- {} +`
     : `rm -rf -- ${shellQuote(input.configDir)}`;
   const result = await runAdapterExecutionTargetShellCommand(input.runId, input.target, command, {
     cwd: input.cwd,
@@ -606,6 +609,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         action: "harden", cwd, timeoutSec, graceSec,
       });
       preparedRuntimeConfig.env.XDG_CONFIG_HOME = remoteConfigDir;
+      if (!bearerConfig.managedMcpOverlayContentForHome) {
+        throw new Error("OpenCode managed MCP overlay was not prepared.");
+      }
+      preparedRuntimeConfig.env.OPENCODE_CONFIG_CONTENT =
+        bearerConfig.managedMcpOverlayContentForHome(remoteConfigDir);
       preparedRuntimeConfig.notes.push(`Injected ${runtimeMcpServers.length} Paperclip-managed OpenCode MCP server(s).`);
     }
     if (executionTarget?.kind === "remote" && runtimeMcpServers.length > 0) {

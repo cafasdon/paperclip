@@ -434,7 +434,16 @@ describe("opencode remote execution", () => {
     expect(stagedConfig).toMatchObject({ mcp: { research: {
       type: "remote", headers: { Authorization: `Bearer ${bearer}` }, enabled: true, oauth: false,
     } } });
+    const invocation = runChildProcess.mock.calls.find((call) => call[2]?.includes("run")) as unknown as
+      | [string, string, string[], { env: Record<string, string> }]
+      | undefined;
+    const remoteOverlay = JSON.parse(invocation?.[3].env.OPENCODE_CONFIG_CONTENT ?? "null");
+    expect(remoteOverlay.mcp.research.url).toMatch(
+      new RegExp(`^\\{file:${configDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/opencode/paperclip-managed-mcp-[a-f0-9-]+\\.url\\}$`),
+    );
+    expect(JSON.stringify(remoteOverlay)).not.toContain(bearer);
     expect(runSshCommand).toHaveBeenCalledWith(expect.anything(), expect.stringContaining(`chmod 600 '${configDir}/opencode/opencode.json'`), expect.anything());
+    expect(runSshCommand).toHaveBeenCalledWith(expect.anything(), expect.stringContaining("-name 'paperclip-managed-mcp-*' -exec chmod 600"), expect.anything());
     expect(runSshCommand).toHaveBeenCalledWith(expect.anything(), expect.stringContaining(`rm -rf -- '${configDir}'`), expect.anything());
     expect(JSON.stringify({ args: runChildProcess.mock.calls.map((call) => call[2]), logs, metadata })).not.toContain(bearer);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalled();

@@ -65,6 +65,14 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(await fs.readFile(path.join(configHome, "opencode", "opencode.json"), "utf8"))
       .toBe(`${JSON.stringify(source, null, 2)}\n`);
     expect(JSON.stringify(prepared.notes)).not.toContain("test-bearer-secret");
+    const overlay = JSON.parse(prepared.env.OPENCODE_CONFIG_CONTENT!);
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain("test-bearer-secret");
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain(managedServers[0]!.url);
+    const managedOverlay = overlay.mcp["research-connecti"];
+    expect(managedOverlay.timeout).toBe(75_000);
+    expect(await fs.readFile(managedOverlay.url.slice(6, -1), "utf8")).toBe(managedServers[0]!.url);
+    expect(await fs.readFile(managedOverlay.headers.Authorization.slice(6, -1), "utf8"))
+      .toBe("Bearer test-bearer-secret");
     if (process.platform !== "win32") {
       expect((await fs.stat(runtimeConfigPath)).mode & 0o777).toBe(0o600);
     }
@@ -122,6 +130,35 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(await fs.readFile(path.join(configDir, "opencode.json"), "utf8")).toBe(commentedJson);
     expect(await fs.readFile(path.join(configDir, "opencode.jsonc"), "utf8")).toBe(laterJsonc);
     expect(prepared.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe("true");
+    await prepared.cleanup();
+  });
+
+  it("reasserts the managed endpoint after a conflicting home OpenCode config without putting secrets in env", async () => {
+    const configHome = await makeConfigHome();
+    const home = path.join(configHome, "home");
+    await fs.mkdir(path.join(home, ".opencode"), { recursive: true });
+    const conflictingHome = '{"mcp":{"research":{"type":"remote","url":"https://untrusted.example.test/mcp"}}}';
+    await fs.writeFile(path.join(home, ".opencode", "opencode.json"), conflictingHome);
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, HOME: home },
+      config: { dangerouslySkipPermissions: false },
+      runtimeMcpServers: [managedServers[0]!],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const overlay = JSON.parse(prepared.env.OPENCODE_CONFIG_CONTENT!);
+    const managedOverlay = overlay.mcp.research;
+    expect(managedOverlay.type).toBe("remote");
+    expect(await fs.readFile(managedOverlay.url.slice(6, -1), "utf8")).toBe(managedServers[0]!.url);
+    expect(await fs.readFile(managedOverlay.headers.Authorization.slice(6, -1), "utf8"))
+      .toBe(`Bearer ${managedServers[0]!.token}`);
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain(managedServers[0]!.url);
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain(managedServers[0]!.token);
+    expect(await fs.readFile(path.join(home, ".opencode", "opencode.json"), "utf8"))
+      .toBe(conflictingHome);
+    expect(prepared.managedMcpOverlayContentForHome?.("/remote/xdgConfig"))
+      .toContain("{file:/remote/xdgConfig/opencode/paperclip-managed-mcp-");
+    expect(() => prepared.managedMcpOverlayContentForHome?.("/remote/bad}path"))
+      .toThrow("cannot be used in a file reference");
     await prepared.cleanup();
   });
 

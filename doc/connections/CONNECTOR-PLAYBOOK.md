@@ -1039,6 +1039,8 @@ not prove that an upstream write was cancelled. Reconcile the remote state
 before retrying a write after a timeout.
 OpenCode-managed connections use a 75-second client deadline so its tool call
 can receive the result of Paperclip's maximum 60-second gateway wait.
+Its managed MCP endpoints are reasserted through a final file-backed per-run
+config layer, so a home OpenCode config cannot redirect a managed bearer.
 
 Responses may contain secret IDs, version selectors, header names, prefixes,
 scope names, expiry timestamps, and redacted provider metadata. They must not

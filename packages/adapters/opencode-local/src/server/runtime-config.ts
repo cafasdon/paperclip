@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
@@ -10,7 +10,10 @@ type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
   notes: string[];
   cleanup: () => Promise<void>;
+  managedMcpOverlayContentForHome?: (configHome: string) => string;
 };
+
+type ManagedOpenCodeMcpServer = { name: string; url: string; token: string };
 
 /** Session identity excludes bearer tokens and is stable across server ordering. */
 export function openCodeMcpServerIdentity(servers: AdapterRuntimeMcpServer[]): string {
@@ -58,8 +61,9 @@ export function routeRemoteProjectToolsMcpThroughBridge(input: {
 function managedMcpEntries(
   existing: Record<string, unknown>,
   servers: AdapterRuntimeMcpServer[],
-): Record<string, unknown> {
+): { mcp: Record<string, unknown>; managed: ManagedOpenCodeMcpServer[] } {
   const mcp: Record<string, unknown> = Object.assign(Object.create(null), existing);
+  const managed: ManagedOpenCodeMcpServer[] = [];
   const usedNames = new Set(Object.keys(existing));
   for (const server of [...servers].sort((a, b) =>
     JSON.stringify([a.name, a.url, a.connectionId]).localeCompare(JSON.stringify([b.name, b.url, b.connectionId]))
@@ -91,8 +95,33 @@ function managedMcpEntries(
       // also uses this timeout for tools/call, so leave room for gateway overhead.
       timeout: 75_000,
     };
+    managed.push({ name, url: server.url, token: server.token });
   }
-  return mcp;
+  return { mcp, managed };
+}
+
+function managedMcpOverlayContentForHome(
+  configHome: string,
+  files: Array<{ name: string; urlFile: string; authorizationFile: string }>,
+): string {
+  const mcp: Record<string, unknown> = Object.create(null);
+  const normalizedHome = configHome.replaceAll("\\", "/");
+  if (/[{}\r\n]/.test(normalizedHome)) {
+    throw new Error("OpenCode runtime config path cannot be used in a file reference.");
+  }
+  const fileRef = (filename: string) =>
+    `{file:${path.posix.join(normalizedHome, "opencode", filename)}}`;
+  for (const entry of files) {
+    mcp[entry.name] = {
+      type: "remote",
+      url: fileRef(entry.urlFile),
+      enabled: true,
+      oauth: false,
+      headers: { Authorization: fileRef(entry.authorizationFile) },
+      timeout: 75_000,
+    };
+  }
+  return JSON.stringify({ mcp });
 }
 
 function resolveXdgConfigHome(env: Record<string, string>): string {
@@ -366,29 +395,57 @@ export async function prepareOpenCodeRuntimeConfig(input: {
       nextConfig.small_model = smallModel;
       notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
     }
+    let managed: ManagedOpenCodeMcpServer[] = [];
     if (runtimeMcpServers.length > 0) {
       if (existingConfig.mcp !== undefined && !isPlainObject(existingConfig.mcp)) {
         throw new Error("Existing OpenCode MCP config is not an object.");
       }
-      nextConfig.mcp = managedMcpEntries(
+      const entries = managedMcpEntries(
         isPlainObject(existingConfig.mcp) ? existingConfig.mcp : {},
         runtimeMcpServers,
       );
+      nextConfig.mcp = entries.mcp;
+      managed = entries.managed;
       notes.push(`Injected ${runtimeMcpServers.length} Paperclip-managed OpenCode MCP server(s).`);
     }
     await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, { mode: 0o600 });
     await fs.chmod(runtimeConfigPath, 0o600);
 
+    // OpenCode loads $HOME/.opencode after XDG_CONFIG_HOME even when project
+    // config is disabled. Reassert only the managed entries in its final
+    // OPENCODE_CONFIG_CONTENT layer. File references keep endpoint secrets and
+    // bearers out of the process environment while preserving other settings.
+    const overlayFiles: Array<{ name: string; urlFile: string; authorizationFile: string }> = [];
+    for (const server of managed) {
+      const id = randomUUID();
+      const urlFile = `paperclip-managed-mcp-${id}.url`;
+      const authorizationFile = `paperclip-managed-mcp-${id}.authorization`;
+      const urlPath = path.join(runtimeConfigDir, urlFile);
+      const authorizationPath = path.join(runtimeConfigDir, authorizationFile);
+      await fs.writeFile(urlPath, server.url, { mode: 0o600, flag: "wx" });
+      await fs.writeFile(authorizationPath, `Bearer ${server.token}`, { mode: 0o600, flag: "wx" });
+      await fs.chmod(urlPath, 0o600);
+      await fs.chmod(authorizationPath, 0o600);
+      overlayFiles.push({ name: server.name, urlFile, authorizationFile });
+    }
+    const overlayForHome = overlayFiles.length > 0
+      ? (home: string) => managedMcpOverlayContentForHome(home, overlayFiles)
+      : undefined;
+
     return {
       env: {
         ...input.env,
         XDG_CONFIG_HOME: runtimeConfigHome,
-        ...(runtimeMcpServers.length > 0 ? { OPENCODE_DISABLE_PROJECT_CONFIG: "true" } : {}),
+        ...(overlayForHome ? {
+          OPENCODE_DISABLE_PROJECT_CONFIG: "true",
+          OPENCODE_CONFIG_CONTENT: overlayForHome(runtimeConfigHome),
+        } : {}),
       },
       notes,
       cleanup: async () => {
         await fs.rm(runtimeConfigHome, { recursive: true, force: true });
       },
+      managedMcpOverlayContentForHome: overlayForHome,
     };
   } catch (error) {
     await fs.rm(runtimeConfigHome, { recursive: true, force: true });
