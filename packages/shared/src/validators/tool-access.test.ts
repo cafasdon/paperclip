@@ -8,6 +8,7 @@ import {
   toolCredentialSecretRefSchema,
   toolRedactedValueSummarySchema,
   toolTransportConfigSchema,
+  updateToolConnectionSchema,
 } from "./tool-access.js";
 
 describe("tool access validators", () => {
@@ -187,6 +188,27 @@ describe("tool access validators", () => {
     });
 
     expect(parsed.success).toBe(true);
+  });
+
+  it("accepts only numeric remote MCP tool timeout configuration", () => {
+    const connection = {
+      name: "Remote MCP fixture",
+      transport: "mcp_remote",
+      config: { url: "https://example.test/mcp", remoteMcpToolTimeoutMs: 60_000 },
+    };
+    expect(createToolConnectionSchema.safeParse(connection).success).toBe(true);
+    expect(updateToolConnectionSchema.safeParse({ config: connection.config }).success).toBe(true);
+    expect(createToolConnectionSchema.safeParse({
+      ...connection,
+      config: { ...connection.config, remoteMcpToolTimeoutMs: "60000" },
+    }).success).toBe(false);
+    expect(updateToolConnectionSchema.safeParse({
+      config: { ...connection.config, remoteMcpToolTimeoutMs: "60000" },
+    }).success).toBe(false);
+    expect(createToolConnectionSchema.safeParse({
+      ...connection,
+      config: { ...connection.config, remoteMcpToolTimeoutMs: Infinity },
+    }).success).toBe(false);
   });
 
   it("keeps invocation payload summaries redacted and bounded", () => {
