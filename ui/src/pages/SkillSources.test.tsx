@@ -14,7 +14,7 @@ vi.mock('@/lib/router', () => ({
   useNavigate: () => context.navigate,
   useParams: () => ({ sourceId: context.sourceId }),
 }));
-vi.mock('@/api/skillSources', () => ({ skillSourcesApi: { list: vi.fn(), repositories: vi.fn(), discover: vi.fn(), create: vi.fn(), select: vi.fn(), refresh: vi.fn(), disconnect: vi.fn() } }));
+vi.mock('@/api/skillSources', () => ({ skillSourcesApi: { list: vi.fn(), repositories: vi.fn(), discoverStream: vi.fn(), create: vi.fn(), select: vi.fn(), refresh: vi.fn(), disconnect: vi.fn() } }));
 
 const repos = {
   connections: [{ id: 'personal', name: 'Personal' }, { id: 'shared', name: 'Engineering' }],
@@ -49,7 +49,7 @@ beforeEach(() => {
   vi.spyOn(HTMLElement.prototype, 'scrollIntoView').mockImplementation(() => {});
   vi.mocked(skillSourcesApi.list).mockResolvedValue([]);
   vi.mocked(skillSourcesApi.repositories).mockResolvedValue(structuredClone(repos));
-  vi.mocked(skillSourcesApi.discover).mockResolvedValue(discovery);
+  vi.mocked(skillSourcesApi.discoverStream).mockResolvedValue(discovery);
   context.sourceId = 'new';
   sessionStorage.clear();
 });
@@ -59,6 +59,48 @@ afterEach(async () => {
 });
 
 describe('GitHub skill source import', () => {
+  it('shows streamed candidates without allowing a partial import, then discards them on failure', async () => {
+    let fail!: (error: Error) => void;
+    vi.mocked(skillSourcesApi.discoverStream).mockImplementation((_company, _input, update) => {
+      update({ type: 'progress', phase: 'checking', totalSkills: 20, checkedSkills: 1, currentPath: 'one/references/guide.md', checkedFiles: 2, totalFiles: 10 });
+      update({ type: 'candidate', candidate: { path: 'one/SKILL.md', name: 'Code review', description: null, fileCount: 10, error: null } });
+      return new Promise((_resolve, reject) => { fail = reject; });
+    });
+    await mount();
+    await act(async () => (document.querySelector('[cmdk-item]') as HTMLElement).click());
+    await act(async () => button('Find skills').click()); await flush();
+    expect(document.body.textContent).toContain('20 skills found');
+    expect(document.body.textContent).toContain('1 of 20 checked');
+    expect(document.body.textContent).toContain('Code review');
+    expect(document.querySelector('progress')?.value).toBe(1);
+    expect(document.querySelectorAll('[role="checkbox"]')).toHaveLength(0);
+    expect(skillSourcesApi.create).not.toHaveBeenCalled();
+    await act(async () => fail(new Error('Network interrupted'))); await flush();
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('Network interrupted');
+    expect(document.body.textContent).not.toContain('Code review');
+    expect(button('Find skills').disabled).toBe(false);
+  });
+  it('cancels a scan, preserves the repository, and ignores late progress and completion', async () => {
+    let finish!: (result: typeof discovery) => void;
+    let update!: Parameters<typeof skillSourcesApi.discoverStream>[2];
+    let signal: AbortSignal | undefined;
+    vi.mocked(skillSourcesApi.discoverStream).mockImplementation((_company, _input, callback, active) => {
+      update = callback; signal = active; return new Promise(resolve => { finish = resolve; });
+    });
+    await mount();
+    await act(async () => (document.querySelector('[cmdk-item]') as HTMLElement).click());
+    await act(async () => button('Find skills').click()); await flush();
+    await act(async () => button('Cancel scan').click());
+    expect(signal?.aborted).toBe(true);
+    await act(async () => {
+      update({ type: 'candidate', candidate: { path: 'late/SKILL.md', name: 'Late result', description: null, error: null, fileCount: 1 } });
+      finish(discovery);
+    }); await flush();
+    expect(document.body.textContent).not.toContain('Late result');
+    expect(button('Find skills').disabled).toBe(false);
+    expect(JSON.parse(sessionStorage.getItem('paperclip.skill-source-draft:company-1:new')!).repositoryUrl).toBe('https://github.com/acme/team-skills');
+  });
+
   it('searches the combined repository inventory and uses the selected repository’s authorized connection', async () => {
     await mount();
     expect(document.querySelectorAll('[cmdk-item]')).toHaveLength(2);
@@ -74,20 +116,20 @@ describe('GitHub skill source import', () => {
     expect(document.querySelectorAll('[cmdk-item]')).toHaveLength(1);
     await act(async () => (document.querySelector('[cmdk-item]') as HTMLElement).click());
     await act(async () => button('Find skills').click());
-    expect(skillSourcesApi.discover).toHaveBeenCalledWith('company-1', { repositoryUrl: 'https://github.com/acme/design', connectionId: 'shared' });
+    expect(skillSourcesApi.discoverStream).toHaveBeenCalledWith('company-1', { repositoryUrl: 'https://github.com/acme/design', connectionId: 'shared' }, expect.any(Function), expect.any(AbortSignal));
   });
   it('recognizes pasted branch URLs and does not reuse their branch or credentials for another repository', async () => {
     await mount();
     await act(async () => button('... or add public repo by URL').click());
     await input('input[placeholder="https://github.com/owner/repository"]', 'https://github.com/ACME/team-skills/tree/feature/new-skills');
     await act(async () => button('Find skills').click());
-    expect(skillSourcesApi.discover).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/ACME/team-skills/tree/feature/new-skills', connectionId: 'personal' });
+    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/ACME/team-skills/tree/feature/new-skills', connectionId: 'personal' }, expect.any(Function), expect.any(AbortSignal));
     await flush();
     expect(document.body.textContent).toContain('feature/new-skills');
     await act(async () => button('Back').click());
     await input('input[placeholder="https://github.com/owner/repository"]', 'https://github.com/public/skills');
     await act(async () => button('Find skills').click());
-    expect(skillSourcesApi.discover).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/public/skills', connectionId: null });
+    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/public/skills', connectionId: null }, expect.any(Function), expect.any(AbortSignal));
   });
   it('links empty repositories to standard GitHub setup in Apps while preserving the import draft', async () => {
     vi.mocked(skillSourcesApi.repositories).mockResolvedValue({ repositories: [], connections: [], connectionCount: 0, failedConnectionCount: 0 });

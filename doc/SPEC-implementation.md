@@ -1776,6 +1776,15 @@ unavailable. Preserve current ownership and newer-work fences. See
 
 ## GitHub-synced skill sources
 
+- Discovery supports opt-in `Accept: application/x-ndjson` on the existing discovery
+  endpoint. Progress events report repository/tree/package stages, checked skill
+  counts, and the current package's file counts; candidate events contain metadata,
+  never file contents. Only the final `complete` event makes the scan selectable.
+  Interrupted streams discard partial results, and cancellation stops further
+  provider reads. The default JSON API remains compatible. The import dialog uses
+  reduced-motion-aware animations and shows indeterminate progress while saving
+  complete packages, without inventing completion percentages.
+
 - Sources and entries are company-scoped. Reuse GitHub connection grants and credential
   refresh; every provider read authorizes the current caller. Saved connection IDs do
   not confer access to another user's token. Agent reads use managed run identities.

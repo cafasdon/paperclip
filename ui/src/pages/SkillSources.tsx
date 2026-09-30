@@ -1,8 +1,8 @@
 import { GithubIcon } from "@/components/icons/github-icon";
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { RefreshCw, Plus, ExternalLink, Check, Lock, GitBranch, FileText } from 'lucide-react';
-import { parseGitHubSkillRepositoryUrl, type SkillSource, type SkillSourceDiscovery, type SkillSourceRefreshResult } from '@paperclipai/shared';
+import { parseGitHubSkillRepositoryUrl, type SkillSource, type SkillSourceDiscovery, type SkillSourceRefreshResult, type SkillSourceScanProgress } from '@paperclipai/shared';
 import { Link, useNavigate, useParams } from '@/lib/router';
 import { useCompany } from '@/context/CompanyContext';
 import { useBreadcrumbs } from '@/context/BreadcrumbContext';
@@ -13,6 +13,7 @@ import { appSourceConnectHref } from './apps/app-connect-policy';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { SkillImportProgress, type FoundSkill } from './skills/SkillImportProgress';
 import { SkillPackagePreview } from './skills/SkillPackagePreview';
 import { SkillSourceTree, type SkillTreeCandidate } from './skills/SkillSourceTree';
 import { timeAgo } from '@/lib/timeAgo';
@@ -118,10 +119,23 @@ function SourceDialog({ companyId, source, onClose, onSaved }: {
   const rememberReturn = () => rememberSkillSourceReturn(companyId, source?.id ?? 'new');
   useEffect(() => { consumeSkillSourceReturn(companyId); }, [companyId]);
   useEffect(() => { sessionStorage.setItem(draftKey, JSON.stringify({ revision: selectionRevision, repositoryUrl, showRepositoryUrl, connectionId, discovery, selectedPaths: [...selected], excludedFolders })); }, [draftKey, selectionRevision, repositoryUrl, showRepositoryUrl, connectionId, discovery, selected, excludedFolders]);
-  const scan = useMutation({ mutationFn: async () => ({
-    discovery: await skillSourcesApi.discover(companyId, { repositoryUrl, connectionId: availableConnectionId }),
-    connectionId: availableConnectionId,
-  }), onSuccess: result => {
+  const scanController = useRef<AbortController | null>(null);
+  const [progress, setProgress] = useState<SkillSourceScanProgress | null>(null);
+  const [found, setFound] = useState<FoundSkill[]>([]);
+  useEffect(() => () => { scanController.current?.abort(); }, []);
+  const scan = useMutation({ mutationFn: async () => {
+    const controller = new AbortController();
+    scanController.current?.abort();
+    scanController.current = controller;
+    setProgress(null); setFound([]);
+    const result = await skillSourcesApi.discoverStream(companyId, { repositoryUrl, connectionId: availableConnectionId }, event => {
+      if (controller.signal.aborted || scanController.current !== controller) return;
+      if (event.type === 'progress') setProgress(event);
+      else setFound(previous => [...previous.filter(skill => skill.path !== event.candidate.path), event.candidate]);
+    }, controller.signal);
+    return { discovery: result, connectionId: availableConnectionId, controller };
+  }, onSuccess: result => {
+    if (result.controller.signal.aborted || scanController.current !== result.controller) return;
     setDiscovery(result.discovery); setConnectionId(result.connectionId); setSelected(new Set(result.discovery.candidates.map(candidate => candidate.path))); setExcludedFolders([]);
   } });
   const save = useMutation({ mutationFn: () => source
@@ -136,12 +150,13 @@ function SourceDialog({ companyId, source, onClose, onSaved }: {
   const eligibleCount = candidates.filter(candidate => selected.has(candidate.path) && !candidate.error).length;
   const skippedCount = candidates.filter(candidate => selected.has(candidate.path) && candidate.error).length;
   const busy = scan.isPending || save.isPending;
-  const error = scan.error ?? save.error;
+  const error = (scan.error?.name === 'AbortError' ? null : scan.error) ?? save.error;
+  function stopScan() { scanController.current?.abort(); scanController.current = null; scan.reset(); setProgress(null); setFound([]); }
   function clearScan() { setDiscovery(null); scan.reset(); save.reset(); }
-  function dismiss() { sessionStorage.removeItem(draftKey); onClose(); }
-  return <Dialog open onOpenChange={open => { if (!open && !busy) dismiss(); }}><DialogContent className="flex max-h-(--sz-calc-18) flex-col overflow-y-auto p-4 sm:max-w-2xl sm:p-6" aria-describedby={source ? 'source-description' : undefined}>
+  function dismiss() { stopScan(); sessionStorage.removeItem(draftKey); onClose(); }
+  return <Dialog open onOpenChange={open => { if (!open && !save.isPending) dismiss(); }}><DialogContent className="flex max-h-(--sz-calc-18) flex-col overflow-y-auto p-4 sm:max-w-2xl sm:p-6" aria-describedby={source ? 'source-description' : undefined}>
     <DialogHeader><DialogTitle>{source ? source.fullName : 'Import from GitHub'}</DialogTitle>{source && <DialogDescription id="source-description">Choose the skills to keep synced. Unchecked skills stay installed.</DialogDescription>}</DialogHeader>
-      {!ready && <div className="flex flex-col gap-4">
+      {!ready && !scan.isPending && <div className="flex flex-col gap-4">
         <div className="flex flex-col gap-2">
           {availableRepositories.length > 0 && <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
@@ -180,20 +195,21 @@ function SourceDialog({ companyId, source, onClose, onSaved }: {
         </div>
         {showRepositoryUrl && <label id="source-repository-url" className="flex flex-col gap-2 text-sm">Repository URL<Input autoFocus value={repositoryUrl} onChange={event => { setRepositoryUrl(event.target.value); clearScan(); }} placeholder="https://github.com/owner/repository" disabled={busy} /></label>}
       </div>}
-      {ready && <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+      {ready && !save.isPending && <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
         {!source && <span className="break-all">{discovery?.fullName}</span>}
         <span className="inline-flex items-center gap-1.5"><GitBranch className="size-3.5" /><span className="font-mono">{source?.trackingRef === 'HEAD' ? 'Default branch' : source?.trackingRef ?? discovery?.trackingRef}</span></span>
         <a href={source?.repositoryUrl ?? discovery?.repositoryUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-foreground">View on GitHub<ExternalLink className="size-3" /></a>
       </div>}
       {source?.lastError && <p role="alert" className="text-sm text-destructive">{source.lastError}{' '}<Link onClick={rememberReturn} to={source.connectionId ? `/apps/${source.connectionId}/permissions` : connectHref} className="underline">Manage GitHub connection</Link></p>}
-      {ready && <SkillSourceTree onPreview={(skill, filePath) => setPreview({ skill, filePath })} candidates={candidates} selected={selected} excludedFolders={excludedFolders} onChange={(paths, folders) => { setSelected(paths); setExcludedFolders(folders); }} disabled={busy} />}
+      {ready && !save.isPending && <SkillSourceTree onPreview={(skill, filePath) => setPreview({ skill, filePath })} candidates={candidates} selected={selected} excludedFolders={excludedFolders} onChange={(paths, folders) => { setSelected(paths); setExcludedFolders(folders); }} disabled={busy} />}
       {discovery?.warnings.map(warning => <p key={warning} className="text-xs text-muted-foreground">{warning}</p>)}
       {skippedCount > 0 && <p className="text-sm text-muted-foreground">{skippedCount} selected {skippedCount === 1 ? 'skill has' : 'skills have'} validation errors and will be skipped.</p>}
       {error && <p role="alert" className="text-sm text-destructive">{error.message}{' '}<Link onClick={rememberReturn} to={connectHref} className="underline">Connect a GitHub account</Link></p>}
-      {scan.isPending && <p role="status" className="text-sm text-muted-foreground">Finding skills throughout the repository and checking their files…</p>}
-      {save.isPending && <p role="status" className="text-sm text-muted-foreground">Importing skills and saving your selection…</p>}
+      {scan.isPending && <SkillImportProgress repository={parsedRepository?.fullName ?? repositoryUrl} progress={progress} found={found} />}
+      {save.isPending && <SkillImportProgress importing repository={source?.fullName ?? discovery!.fullName} count={eligibleCount}
+        found={candidates.filter(candidate => selected.has(candidate.path) && !candidate.error).map(candidate => ({ ...candidate, fileCount: candidate.inspection?.files.length ?? 1 }))} />}
       <footer className="flex items-center justify-between gap-3 border-t border-border pt-4">
-        <Button variant="ghost" disabled={busy} onClick={() => { if (discovery && !source) clearScan(); else dismiss(); }}>{discovery && !source ? 'Back' : 'Cancel'}</Button>
+        <Button variant="ghost" disabled={save.isPending} onClick={() => { if (scan.isPending) stopScan(); else if (discovery && !source) clearScan(); else dismiss(); }}>{scan.isPending ? 'Cancel scan' : discovery && !source ? 'Back' : 'Cancel'}</Button>
         {ready ? <Button disabled={busy || (!source && selected.size === 0)} onClick={() => save.mutate()}>{save.isPending ? 'Saving…' : source ? 'Save selection' : `Import ${eligibleCount} ${eligibleCount === 1 ? "skill" : "skills"}`}</Button>
           : <Button disabled={busy || repositories.isPending || !repositoryUrl.trim()} onClick={() => scan.mutate()}>{scan.isPending ? 'Scanning…' : 'Find skills'}</Button>}
       </footer>

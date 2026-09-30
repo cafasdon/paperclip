@@ -5,13 +5,13 @@ import { COMPANY_ID, SOURCE_ID, installFixtures, type RepositoryScenario } from 
 import { Link, Route, Routes, useNavigate } from "@/lib/router";
 import { SkillSources } from "@/pages/SkillSources";
 
-function SourcesStory({ view = "sources", empty = false, needsConnection = false, repositories = "single", repositoryUrl = "" }: {
-  view?: "sources" | "import" | "manage"; empty?: boolean; needsConnection?: boolean; repositories?: RepositoryScenario; repositoryUrl?: string;
+function SourcesStory({ view = "sources", empty = false, needsConnection = false, repositories = "single", repositoryUrl = "", scan }: {
+  view?: "sources" | "import" | "manage"; empty?: boolean; needsConnection?: boolean; repositories?: RepositoryScenario; repositoryUrl?: string; scan?: "live" | "large" | "interrupted";
 }) {
   const [ready, setReady] = useState(false);
   const navigate = useNavigate();
   useEffect(() => {
-    const cleanup = installFixtures(empty, needsConnection, { repositories });
+    const cleanup = installFixtures(empty, needsConnection, { repositories, scan });
     for (const id of ["new", SOURCE_ID]) sessionStorage.removeItem(`paperclip.skill-source-draft:${COMPANY_ID}:${id}`);
     if (repositoryUrl) sessionStorage.setItem(`paperclip.skill-source-draft:${COMPANY_ID}:new`, JSON.stringify({ repositoryUrl }));
     navigate(`/skills/sources${view === "import" ? "/new" : view === "manage" ? `/${SOURCE_ID}` : ""}`, { replace: true });
@@ -19,7 +19,7 @@ function SourcesStory({ view = "sources", empty = false, needsConnection = false
     return cleanup;
     // Install each story's fixtures only once; route changes belong to the user.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [empty, needsConnection, view, repositories, repositoryUrl]);
+  }, [empty, needsConnection, view, repositories, repositoryUrl, scan]);
   if (!ready) return null;
   return <Routes>
     <Route path="/:companyPrefix/skills/sources/:sourceId" element={<SkillSources />} />
@@ -69,4 +69,20 @@ export const ReviewReferences: Story = {
     const page = within(canvasElement.ownerDocument.body);
     await userEvent.click(await page.findByRole('button', { name: 'Inspect Security review' }));
   },
+};
+
+const startScan: NonNullable<Story['play']> = async ({ canvasElement }) => {
+  const page = within(canvasElement.ownerDocument.body);
+  await userEvent.click(await page.findByRole('button', { name: 'Find skills' }));
+};
+export const Scanning: Story = {
+  name: 'Import · Live discovery', args: { view: 'import', empty: true, repositoryUrl: 'https://github.com/acme/team-skills', scan: 'live' }, play: startScan,
+  parameters: { docs: { description: { story: 'Timed fixture events exercise the real production scan UI, then open selection. No GitHub requests.' } } },
+};
+export const LargeRepository: Story = {
+  name: 'Import · Large repository', args: { view: 'import', empty: true, repositoryUrl: 'https://github.com/acme/team-skills', scan: 'large' }, play: startScan,
+  parameters: { docs: { description: { story: 'A deliberately paused 128-skill fixture. Watch package files arrive or cancel the scan.' } } },
+};
+export const InterruptedScan: Story = {
+  name: 'Import · Interrupted scan', args: { view: 'import', empty: true, repositoryUrl: 'https://github.com/acme/team-skills', scan: 'interrupted' }, play: startScan,
 };

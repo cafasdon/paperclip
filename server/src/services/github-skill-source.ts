@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { CompanySkillVersionFileInventoryEntry, SkillSourceCandidate, SkillSourceDiscovery, SkillSourcePreviewRequest, SkillSourceFilePreview } from '@paperclipai/shared';
+import type { CompanySkillVersionFileInventoryEntry, SkillSourceCandidate, SkillSourceDiscovery, SkillSourcePreviewRequest, SkillSourceFilePreview, SkillSourceScanUpdate, SkillSourceScanProgress } from '@paperclipai/shared';
 import { parseFrontmatterMarkdown, parseGitHubSkillRepositoryUrl } from '@paperclipai/shared';
 import { notFound, unprocessable } from '../errors.js';
 import { assertSkillSnapshotPath, snapshotFile, skillFileBytes } from './skill-snapshot.js';
@@ -19,7 +19,24 @@ export function parseSkillRepository(url: string) {
   return parsed;
 }
 
-export async function scanGitHubSkills(input: { repositoryUrl: string; trackingRef?: string; commitSha?: string; onlySkillPath?: string }, read: GitHubRead): Promise<ScannedSkillSource> {
+export interface SkillScanOptions {
+  signal?: AbortSignal;
+  onProgress?: (event: SkillSourceScanUpdate) => void | Promise<void>;
+}
+
+export async function scanGitHubSkills(input: { repositoryUrl: string; trackingRef?: string; commitSha?: string; onlySkillPath?: string }, providerRead: GitHubRead, options: SkillScanOptions = {}): Promise<ScannedSkillSource> {
+  const read: GitHubRead = async apiPath => {
+    options.signal?.throwIfAborted();
+    const result = await providerRead(apiPath);
+    options.signal?.throwIfAborted();
+    return result;
+  };
+  const progress: SkillSourceScanProgress = { type: 'progress', phase: 'connecting', totalSkills: null, checkedSkills: 0, currentPath: null, checkedFiles: 0, totalFiles: null };
+  const report = async () => {
+    options.signal?.throwIfAborted();
+    await options.onProgress?.({ ...progress });
+  };
+  await report();
   const parsed = parseSkillRepository(input.repositoryUrl);
   const repo = await read(`/repos/${parsed.fullName}`) as { id: number; full_name: string; default_branch: string };
   if (!repo.id || !repo.full_name || !repo.default_branch) throw unprocessable('GitHub returned incomplete repository information.');
@@ -28,6 +45,8 @@ export async function scanGitHubSkills(input: { repositoryUrl: string; trackingR
   const trackingRef = !requestedRef || requestedRef === 'HEAD' ? repo.default_branch : requestedRef;
   const commit = await read(`${base}/commits/${encodeURIComponent(input.commitSha || trackingRef)}`) as { sha: string };
   if (!/^[a-f0-9]{40}$/i.test(commit.sha ?? '')) throw unprocessable('GitHub did not return an immutable commit.');
+  progress.phase = 'listing';
+  await report();
   const tree = await read(`${base}/git/trees/${commit.sha}?recursive=1`) as { tree: TreeEntry[]; truncated?: boolean };
   let entries = tree.tree;
   if (tree.truncated) {
@@ -35,6 +54,8 @@ export async function scanGitHubSkills(input: { repositoryUrl: string; trackingR
     const queue = [{ sha: commit.sha, prefix: '' }];
     for (let i = 0; i < queue.length; i++) {
       const current = queue[i]!;
+      progress.currentPath = current.prefix || null;
+      await report();
       const subtree = await read(`${base}/git/trees/${current.sha}`) as { tree: TreeEntry[]; truncated?: boolean };
       if (subtree.truncated || !Array.isArray(subtree.tree)) throw unprocessable('GitHub returned an incomplete repository tree. Try again.');
       for (const entry of subtree.tree) {
@@ -68,7 +89,10 @@ export async function scanGitHubSkills(input: { repositoryUrl: string; trackingR
     return bytes;
   };
   const skills: DiscoveredSkill[] = [];
-  for (const root of roots.filter(root => !input.onlySkillPath || root.path === input.onlySkillPath).sort((a, b) => a.path.localeCompare(b.path))) {
+  const selectedRoots = roots.filter(root => !input.onlySkillPath || root.path === input.onlySkillPath).sort((a, b) => a.path.localeCompare(b.path));
+  Object.assign(progress, { phase: 'checking', totalSkills: selectedRoots.length, currentPath: null });
+  await report();
+  for (const root of selectedRoots) {
     const dir = path.posix.dirname(root.path);
     const prefix = dir === '.' ? '' : `${dir}/`;
     const owns = (entry: TreeEntry) => {
@@ -81,9 +105,14 @@ export async function scanGitHubSkills(input: { repositoryUrl: string; trackingR
       return parent === dir;
     };
     const inventory = entries.filter(e => e.type !== 'tree' && owns(e));
+    Object.assign(progress, { currentPath: root.path, checkedFiles: 0, totalFiles: inventory.length });
+    await report();
     const files: CompanySkillVersionFileInventoryEntry[] = [];
     let error: string | null = roots.filter(entry => path.posix.dirname(entry.path) === dir).length > 1 ? 'Multiple SKILL.md entrypoints share this package directory.' : null;
     for (const entry of inventory) {
+      progress.currentPath = entry.path;
+      await report();
+      progress.checkedFiles++;
       if (!['100644', '100755'].includes(entry.mode) || entry.type !== 'blob') { error = `Unsupported symlink or submodule: ${entry.path}`; continue; }
       const bytes = await readBlob(entry);
       if (!bytes) { error = `File exceeds the 1 MB limit: ${entry.path}`; continue; }
@@ -100,6 +129,10 @@ export async function scanGitHubSkills(input: { repositoryUrl: string; trackingR
     error ??= findings.filter(f => f.severity === 'error').map(f => `${f.path ?? root.path}: ${f.message}`).join(' ') || null;
     const inspection = { ...inspectSkillPackage(root.path, files, entries.map(entry => entry.path), frontmatter, findings), commitSha: commit.sha };
     skills.push({ path: root.path, name, description, fileCount: inventory.length, error, warnings: inspection.warnings, inspection, files });
+    options.signal?.throwIfAborted();
+    await options.onProgress?.({ type: 'candidate', candidate: { path: root.path, name, description, fileCount: inventory.length, error } });
+    progress.checkedSkills++;
+    await report();
   }
   return { repositoryId: String(repo.id), repositoryUrl: `https://github.com/${repo.full_name.toLowerCase()}`, fullName: repo.full_name, trackingRef, commitSha: commit.sha,
     defaultBranch: repo.default_branch, candidates: skills.map(({ files: _files, ...candidate }) => candidate), warnings, skills };

@@ -69,7 +69,14 @@ export function importedSkill(source: SkillSource, entry: SkillSourceEntry): Com
 export type RepositoryScenario = 'single' | 'multiple' | 'none' | 'empty' | 'partial-error' | 'error' | 'loading';
 
 /** Scoped API fixtures keep the production page interactive without contacting GitHub. */
-export function installFixtures(empty: boolean, needsConnection: boolean, options: { journey?: boolean; refreshed?: boolean; assigned?: boolean; repositories?: RepositoryScenario } = {}) {
+export function installFixtures(empty: boolean, needsConnection: boolean, options: { journey?: boolean; refreshed?: boolean; assigned?: boolean; repositories?: RepositoryScenario; scan?: "live" | "large" | "interrupted"; saving?: boolean } = {}) {
+  const fixtureController = new AbortController();
+  const wait = (ms: number, signal = fixtureController.signal) => new Promise<void>((resolve, reject) => {
+    signal.throwIfAborted();
+    const stop = () => { clearTimeout(timer); reject(new DOMException('Scan cancelled', 'AbortError')); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, ms);
+    signal.addEventListener('abort', stop, { once: true });
+  });
   const original = { ...skillSourcesApi };
   const sources = empty ? [] : [sourceFixture()];
   const originalSkills = { ...companySkillsApi };
@@ -184,12 +191,45 @@ export function installFixtures(empty: boolean, needsConnection: boolean, option
       trackingRef: input.trackingRef || parsed.trackingRef || 'main', commitSha: COMMIT, candidates: discoveryCandidates, warnings: [],
     };
   };
+  skillSourcesApi.discoverStream = async (companyId, input, onProgress, signal) => {
+    const active = signal ? AbortSignal.any([signal, fixtureController.signal]) : fixtureController.signal;
+    const result = await skillSourcesApi.discover(companyId, input);
+    const progress = { type: 'progress' as const, phase: 'connecting' as 'connecting' | 'listing' | 'checking', totalSkills: null as number | null, checkedSkills: 0, currentPath: null as string | null, checkedFiles: 0, totalFiles: null as number | null };
+    onProgress({ ...progress });
+    await wait(options.scan ? 900 : 100, active);
+    progress.phase = 'listing'; onProgress({ ...progress });
+    await wait(options.scan ? 1200 : 100, active);
+    progress.phase = 'checking'; progress.totalSkills = options.scan === 'large' ? 128 : result.candidates.length;
+    for (const candidate of result.candidates) {
+      progress.currentPath = candidate.path; progress.checkedFiles = 0; progress.totalFiles = candidate.fileCount;
+      onProgress({ ...progress });
+      for (const file of candidate.inspection?.files ?? []) {
+        progress.currentPath = `${candidate.path.replace(/SKILL.md$/, '')}${file.path}`;
+        onProgress({ ...progress });
+        await wait(options.scan ? 350 : 50, active);
+        progress.checkedFiles++;
+      }
+      onProgress({ type: 'candidate', candidate });
+      progress.checkedSkills++; onProgress({ ...progress });
+      if (options.scan === 'interrupted' && progress.checkedSkills === 2) throw new Error('GitHub is temporarily unavailable. Try again.');
+    }
+    if (options.scan === 'large') {
+      progress.totalFiles = 72; progress.checkedFiles = 0;
+      for (let file = 0; file < 72; file++) {
+        progress.currentPath = `skills/document-processing/references/guide-${file + 1}.md`;
+        progress.checkedFiles = file; onProgress({ ...progress }); await wait(1000, active);
+      }
+      await wait(3600000, active);
+    }
+    return result;
+  };
   skillSourcesApi.preview = async (_companyId, input) => {
     const file = inspection(input.skillPath).files.find(file => file.path === input.filePath);
     if (!file) throw new Error('File is not included in this package.');
     return { file, content: packageContents[input.skillPath]![input.filePath]!, truncated: false, commitSha: input.commitSha };
   };
   skillSourcesApi.create = async (_companyId, input) => {
+    if (options.saving) await wait(3600000);
     const source = sourceFixture();
     Object.assign(source, { id: `source-${sources.length + 1}`, repositoryUrl: input.repositoryUrl, fullName: input.repositoryUrl.replace("https://github.com/", ""), trackingRef: input.trackingRef || "main", connectionId: input.connectionId ?? null });
     source.entries = source.entries.filter(entry => discoveryCandidates.some(candidate => candidate.path === entry.path)).map(entry => ({ ...entry, sourceId: source.id, skillId: null }));
@@ -218,6 +258,7 @@ export function installFixtures(empty: boolean, needsConnection: boolean, option
     return structuredClone(source);
   };
   return () => {
+    fixtureController.abort();
     Object.assign(skillSourcesApi, original);
     Object.assign(companySkillsApi, originalSkills);
     Object.assign(agentsApi, originalAgents);

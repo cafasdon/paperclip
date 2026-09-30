@@ -3,6 +3,8 @@ import { skillSourceGitHubReader } from "../services/skill-source-github-access.
 import { toolAccessService } from "../services/tool-access.js";
 import { skillSourceCreateSchema, skillSourceDiscoverySchema, skillSourcePreviewSchema, skillSourceSelectionSchema } from "@paperclipai/shared";
 import type { ActivityPublication } from "../services/activity-log.js";
+import { once } from "node:events";
+import type { SkillSourceDiscoveryEvent } from "@paperclipai/shared";
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog } from "@paperclipai/db";
@@ -50,7 +52,7 @@ import {
   listCatalogSkillsOrEmpty,
   readCatalogSkillFile,
 } from "../services/skills-catalog.js";
-import { badRequest, conflict, forbidden, unauthorized } from "../errors.js";
+import { badRequest, conflict, forbidden, unauthorized, HttpError } from "../errors.js";
 import { assertAuthenticated, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { getTelemetryClient } from "../telemetry.js";
 import {
@@ -326,7 +328,35 @@ export function companySkillRoutes(db: Db) {
   });
   router.post("/companies/:companyId/skill-sources/discover", validate(skillSourceDiscoverySchema), async (req, res) => {
     const companyId = req.params.companyId as string;
-    res.json(await sourceOperation(req, companyId, context => sourceSvc.discover(req.body, context)));
+    res.vary("Accept");
+    if (!req.get("Accept")?.includes("application/x-ndjson")) {
+      res.json(await sourceOperation(req, companyId, context => sourceSvc.discover(req.body, context)));
+      return;
+    }
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    res.on("close", stop);
+    const send = async (event: SkillSourceDiscoveryEvent) => {
+      controller.signal.throwIfAborted();
+      if (!res.headersSent) {
+        res.set({ "Content-Type": "application/x-ndjson", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no" });
+        res.flushHeaders();
+      }
+      if (!res.write(`${JSON.stringify(event)}\n`)) await once(res, "drain", { signal: controller.signal });
+    };
+    try {
+      const discovery = await sourceOperation(req, companyId, context => sourceSvc.discover(req.body, context, { signal: controller.signal, onProgress: send }));
+      await send({ type: "complete", discovery });
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      // Preserve normal HTTP errors (including session recovery) before streaming starts.
+      if (!res.headersSent) throw error;
+      await send({ type: "error", status: error instanceof HttpError ? error.status : 500,
+        error: error instanceof HttpError ? error.message : "Repository scan interrupted. Try again." });
+    } finally {
+      res.off("close", stop);
+      if (res.headersSent && !res.destroyed) res.end();
+    }
   });
   router.post("/companies/:companyId/skill-sources/preview", validate(skillSourcePreviewSchema), async (req, res) => {
     const companyId = req.params.companyId as string;

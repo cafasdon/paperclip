@@ -3,7 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
-const mockSkillSourceService = vi.hoisted(() => ({ sourceForSkill: vi.fn(), importFromUrl: vi.fn() }));
+const mockSkillSourceService = vi.hoisted(() => ({ sourceForSkill: vi.fn(), importFromUrl: vi.fn(), discover: vi.fn() }));
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -1364,6 +1364,36 @@ describe("company skill mutation permissions", () => {
     });
   });
 
+  it('streams discovery updates and a final result while retaining JSON compatibility', async () => {
+    const result = { candidates: [], commitSha: 'a'.repeat(40) };
+    mockSkillSourceService.discover.mockImplementation(async (_input, _context, options) => {
+      await options?.onProgress({ type: 'progress', phase: 'listing', totalSkills: null, checkedSkills: 0, currentPath: null, checkedFiles: 0, totalFiles: null });
+      return result;
+    });
+    const app = createApp({ type: 'board', userId: 'board', companyIds: ['company-1'], source: 'local_implicit' });
+    const base = '/api/companies/company-1/skill-sources/discover';
+    const stream = await request(app).post(base).set('Accept', 'application/x-ndjson').send({ repositoryUrl: 'https://github.com/acme/skills' }).expect(200);
+    expect(stream.headers['content-type']).toContain('application/x-ndjson');
+    expect(stream.headers['cache-control']).toBe('no-cache, no-transform');
+    expect(stream.text.trim().split('\n').map((line: string) => JSON.parse(line))).toEqual([
+      expect.objectContaining({ type: 'progress', phase: 'listing' }), { type: 'complete', discovery: result },
+    ]);
+    const json = await request(app).post(base).send({ repositoryUrl: 'https://github.com/acme/skills' }).expect(200);
+    expect(json.body).toEqual(result);
+  });
+  it('terminates failed streams with an error instead of a complete or partial discovery', async () => {
+    mockSkillSourceService.discover.mockImplementation(async (_input, _context, options) => {
+      await options.onProgress({ type: 'progress', phase: 'listing' });
+      throw new Error('Internal credential detail must not leak');
+    });
+    const res = await request(createApp({ type: 'board', userId: 'board', companyIds: ['company-1'], source: 'local_implicit' }))
+      .post('/api/companies/company-1/skill-sources/discover').set('Accept', 'application/x-ndjson').send({ repositoryUrl: 'https://github.com/acme/skills' }).expect(200);
+    const events = res.text.trim().split('\n').map((line: string) => JSON.parse(line));
+    expect(events.at(-1)).toEqual({ type: 'error', error: 'Repository scan interrupted. Try again.', status: 500 });
+    expect(events.some((event: { type: string }) => event.type === 'complete')).toBe(false);
+    expect(res.text).not.toContain('credential detail');
+  });
+
   it("rejects cross-company source reads and mutations for board users and agents", async () => {
     for (const actor of [
       { type: "board", userId: "member", companyIds: ["company-1"], isInstanceAdmin: true, source: "session" },
@@ -1374,6 +1404,7 @@ describe("company skill mutation permissions", () => {
       const responses = await Promise.all([
         request(app).get(base), request(app).get(`${base}/repositories`), request(app).get(`${base}/source-id`),
         request(app).post(`${base}/discover`).send({ repositoryUrl: "https://github.com/acme/skills" }),
+        request(app).post(`${base}/discover`).set('Accept', 'application/x-ndjson').send({ repositoryUrl: "https://github.com/acme/skills" }),
         request(app).post(`${base}/preview`).send({ repositoryUrl: "https://github.com/acme/skills", commitSha: "a".repeat(40), skillPath: "SKILL.md", filePath: "SKILL.md" }),
         request(app).post(base).send({ repositoryUrl: "https://github.com/acme/skills", commitSha: "a".repeat(40), selectedPaths: [] }),
         request(app).patch(`${base}/source-id`).send({ revision: 0, selectedPaths: [], excludedFolders: [] }),

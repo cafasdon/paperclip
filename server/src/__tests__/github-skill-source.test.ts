@@ -1,12 +1,39 @@
 import { githubFixture } from "./helpers/github-skills.js";
 import { describe, expect, it } from 'vitest';
 import { scanGitHubSkills, previewGitHubSkillFile, parseSkillRepository, type GitHubRead } from '../services/github-skill-source.js';
-import { skillSourceDiscoverySchema, skillSourcePreviewSchema } from '@paperclipai/shared';
+import { skillSourceDiscoverySchema, skillSourcePreviewSchema, type SkillSourceScanUpdate } from '@paperclipai/shared';
 import { skillFileBytes } from '../services/skill-snapshot.js';
 
 const sha = 'a'.repeat(40);
 const md = (name: string) => `---\nname: ${name}\ndescription: A useful skill\n---\nFollow these instructions.\n`;
 describe('GitHub skill repository discovery', () => {
+  it('streams real audited package metadata and file counts before returning the complete scan', async () => {
+    const events: SkillSourceScanUpdate[] = [];
+    const fixture = githubFixture({ 'one/SKILL.md': md('one'), 'one/scripts/help.sh': 'echo private-package-content', 'two/SKILL.md': md('two') });
+    const scan = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, async url => {
+      if (url.endsWith('/blobs/2')) expect(events).toContainEqual(expect.objectContaining({ type: 'candidate', candidate: expect.objectContaining({ name: 'one' }) }));
+      return fixture(url);
+    }, { onProgress: event => { events.push(event); } });
+    expect(scan.candidates).toHaveLength(2);
+    expect(events[0]).toMatchObject({ phase: 'connecting', totalSkills: null });
+    expect(events).toContainEqual(expect.objectContaining({ phase: 'checking', totalSkills: 2, checkedSkills: 0, checkedFiles: 1, totalFiles: 2, currentPath: 'one/scripts/help.sh' }));
+    expect(events.at(-1)).toMatchObject({ checkedSkills: 2, checkedFiles: 1 });
+    expect(events.filter(event => event.type === 'candidate')).toHaveLength(2);
+    expect(JSON.stringify(events)).not.toContain('private-package-content');
+    expect(JSON.stringify(events)).not.toContain('inspection');
+  });
+  it('cancels before reading another package when the stream disconnects', async () => {
+    const controller = new AbortController();
+    const events: SkillSourceScanUpdate[] = [];
+    const fixture = githubFixture({ 'one/SKILL.md': md('one'), 'two/SKILL.md': md('two') });
+    const calls: string[] = [];
+    await expect(scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, async url => { calls.push(url); return fixture(url); }, {
+      signal: controller.signal, onProgress: event => { events.push(event); if (event.type === 'candidate') controller.abort(); },
+    })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).not.toContain('/repos/acme/skills/git/blobs/1');
+    expect(events.filter(event => event.type === 'candidate')).toHaveLength(1);
+  });
+
   it('finds root, hidden and deep skills while respecting nested package boundaries', async () => {
     const result = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills', trackingRef: 'feature/new-skills' }, githubFixture({
       'SKILL.md': md('root'), '.agents/very/deep/SKILL.md': md('same-name'), '.agents/very/deep/references/help.md': 'Help',

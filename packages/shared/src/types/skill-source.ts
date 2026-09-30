@@ -85,6 +85,25 @@ export interface SkillSourceDiscovery {
   candidates: SkillSourceCandidate[];
   warnings: string[];
 }
+/** Live scan metadata only. A complete event is required before selections can be imported. */
+export interface SkillSourceScanProgress {
+  type: 'progress';
+  phase: 'connecting' | 'listing' | 'checking';
+  totalSkills: number | null;
+  checkedSkills: number;
+  currentPath: string | null;
+  checkedFiles: number;
+  totalFiles: number | null;
+}
+export type SkillSourceScanUpdate = SkillSourceScanProgress | {
+  type: 'candidate';
+  candidate: Pick<SkillSourceCandidate, 'path' | 'name' | 'description' | 'fileCount' | 'error'>;
+};
+/** Newline-delimited JSON, selected with Accept: application/x-ndjson. */
+export type SkillSourceDiscoveryEvent = SkillSourceScanUpdate
+  | { type: 'complete'; discovery: SkillSourceDiscovery }
+  | { type: 'error'; error: string; status: number };
+
 export interface SkillSourceCreateRequest extends SkillSourceDiscoveryRequest {
   commitSha: string;
   selectedPaths: string[];

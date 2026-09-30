@@ -3185,3 +3185,35 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
      Keep navigation visible; the cross-origin viewer exposes no sizing message. */
   --browser-use-viewer-chrome-height: 70px;
 }
+
+/* GitHub skill scans: real counters with a quiet indeterminate sweep until the tree is known. */
+.skill-import-enter {
+  animation: tc-fade-rise var(--motion-duration-enter) var(--motion-ease-out) both;
+}
+.skill-import-sweep {
+  width: 40%;
+  animation: skill-import-sweep var(--motion-approval-pulse) var(--motion-ease-standard) infinite;
+}
+@keyframes skill-import-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(350%); }
+}
+.skill-import-progress {
+  appearance: none;
+  overflow: hidden;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--muted);
+  color: var(--foreground);
+}
+.skill-import-progress::-webkit-progress-bar { background: var(--muted); }
+.skill-import-progress::-webkit-progress-value {
+  background: var(--foreground);
+  border-radius: var(--radius-sm);
+  transition: width var(--motion-line-scroll) var(--motion-ease-standard);
+}
+.skill-import-progress::-moz-progress-bar { background: var(--foreground); }
+@media (prefers-reduced-motion: reduce) {
+  .skill-import-enter, .skill-import-sweep { animation: none; }
+  .skill-import-progress::-webkit-progress-value { transition: none; }
+}

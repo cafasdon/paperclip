@@ -189,6 +189,19 @@ Bundled/catalog, project/local, unsupported-host, and `skills.sh` imports keep t
 existing behavior. Sync is manual and GitHub.com-only; upstream editing and pull
 requests are not part of this milestone.
 
+While finding skills, the dialog shows the scan stages, the current file, and
+recently checked skills as GitHub returns them. Large repositories show real
+package and file counts; you can cancel and retry without importing partial
+results. Selection opens only after the full scan completes. Importing displays
+an animated saving state while complete local packages are prepared. Animations
+respect reduced-motion preferences.
+
+The discovery API keeps its normal JSON response. Clients requesting
+`Accept: application/x-ndjson` receive `progress` and `candidate` events followed
+by `complete` (containing the discovery response), or a terminal `error`. A stream
+ending without `complete` is unsuccessful; partial candidates are not importable.
+Progress contains metadata only, never package file contents.
+
 Source APIs live beneath `/api/companies/:companyId/skill-sources`:
 
 | Method/path | Purpose |

@@ -6,7 +6,7 @@ import type { CompanySkill, SkillSource, SkillSourceCreateRequest, SkillSourceDi
 import { normalizeAgentUrlKey } from '@paperclipai/shared';
 import { conflict, notFound, unprocessable } from '../errors.js';
 import { companySkillService, parseSkillImportSourceInput } from './company-skills.js';
-import { scanGitHubSkills, previewGitHubSkillFile, type GitHubRead, type ScannedSkillSource } from './github-skill-source.js';
+import { scanGitHubSkills, previewGitHubSkillFile, type GitHubRead, type ScannedSkillSource, type SkillScanOptions } from './github-skill-source.js';
 import { skillSnapshotHash } from './skill-snapshot.js';
 
 type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
@@ -39,9 +39,9 @@ export function skillSourceService(db: Db) {
     const [entry] = await db.select().from(entries).where(and(eq(entries.companyId, companyId), eq(entries.skillId, skillId)));
     return entry ? detail(companyId, entry.sourceId) : null;
   }
-  async function discover(input: SkillSourceDiscoveryRequest, context: SkillSourceContext) {
+  async function discover(input: SkillSourceDiscoveryRequest, context: SkillSourceContext, options?: SkillScanOptions) {
     await context.authorize('skills.import', { sourceType: 'git', sourceLocator: input.repositoryUrl });
-    const { skills: _files, defaultBranch: _defaultBranch, ...result } = await scanGitHubSkills(input, context.read(input.connectionId ?? null));
+    const { skills: _files, defaultBranch: _defaultBranch, ...result } = await scanGitHubSkills(input, context.read(input.connectionId ?? null), options);
     return result;
   }
   async function preview(input: SkillSourcePreviewRequest, context: SkillSourceContext) {
