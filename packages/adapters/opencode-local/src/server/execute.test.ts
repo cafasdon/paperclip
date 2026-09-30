@@ -61,7 +61,8 @@ describe("OpenCode local skill injection", () => {
         type: "remote", url: server.url, enabled: true, oauth: false,
         headers: { Authorization: "Bearer local-test-bearer" },
       });
-      await options.onLog?.("stderr", "runtime echoed local-test-bearer");
+      await options.onLog?.("stderr", "runtime echoed local-test-");
+      await options.onLog?.("stderr", "bearer");
       return probeResult({ stdout: [
         JSON.stringify({ type: "step_start", sessionID: "mcp-session" }),
         JSON.stringify({ type: "text", sessionID: "mcp-session", part: { text: "local-test-bearer" } }),

@@ -4,6 +4,7 @@
 
 ### Patch Changes
 
+- Permit run-scoped project tools calls through the sandbox callback bridge.
 - Allow the Paperclip host to route adapter sandbox-sync full-tree Git enumeration through its process-wide bounded scheduler.
 
 ## 0.3.1

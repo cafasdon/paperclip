@@ -59,7 +59,8 @@ import {
   requireOpenCodeModelId,
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
-import { openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+import { openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes, routeRemoteProjectToolsMcpThroughBridge } from "./runtime-config.js";
+import { createStreamingSecretRedactor } from "./secret-redactor.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
 
@@ -268,11 +269,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const { runId, agent, runtime, config, context, onMeta, onSpawn, authToken } = ctx;
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
   const runtimeMcpIdentity = openCodeMcpServerIdentity(runtimeMcpServers);
-  const bearerTokens = runtimeMcpServers.map(({ token }) => token).filter(Boolean);
-  const redact = (value: string) => bearerTokens.reduce(
-    (current, token) => current.replaceAll(token, "***REDACTED***"), value,
+  const logRedactor = createStreamingSecretRedactor(
+    runtimeMcpServers.map(({ token }) => token), ctx.onLog,
   );
-  const onLog: AdapterExecutionContext["onLog"] = (stream, chunk) => ctx.onLog(stream, redact(chunk));
+  const redact = logRedactor.redact;
+  const onLog: AdapterExecutionContext["onLog"] = logRedactor.write;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -375,10 +376,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  if (authToken) {
+  if (executionTargetIsRemote) {
+    delete env.PAPERCLIP_API_KEY;
+  } else if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, runtimeMcpServers });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env, config, runtimeMcpServers: executionTargetIsRemote ? [] : runtimeMcpServers,
+  });
+  const runtimeConfigCleanups = [preparedRuntimeConfig.cleanup];
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
@@ -531,17 +537,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
         );
       }
-      await ensureRemoteOpenCodeModelConfiguredAndAvailable({
-        runId,
-        executionTarget,
-        command,
-        model,
-        cwd,
-        env: preparedRuntimeConfig.env,
-        timeoutSec,
-        graceSec,
-        redact,
-      });
+      if (runtimeMcpServers.length === 0) {
+        await ensureRemoteOpenCodeModelConfiguredAndAvailable({
+          runId, executionTarget, command, model, cwd,
+          env: preparedRuntimeConfig.env, timeoutSec, graceSec, redact,
+        });
+      }
     }
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
@@ -553,10 +554,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runtimeRootDir: remoteRuntimeRootDir,
         adapterKey: "opencode",
         timeoutSec,
-        hostApiToken: preparedRuntimeConfig.env.PAPERCLIP_API_KEY,
+        hostApiToken: authToken,
         onLog,
       });
       if (paperclipBridge) {
+        logRedactor.addSecret(paperclipBridge.env.PAPERCLIP_API_KEY);
         Object.assign(preparedRuntimeConfig.env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
           runtimeEnv: Object.fromEntries(
@@ -568,6 +570,57 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           resolvedCommand,
         });
       }
+    }
+
+    if (executionTargetIsRemote && runtimeMcpServers.length > 0) {
+      if (executionTarget?.kind !== "remote" || !paperclipBridge) {
+        throw new Error("Paperclip-managed OpenCode MCP requires a live remote bridge.");
+      }
+      const bridgedServers = routeRemoteProjectToolsMcpThroughBridge({
+        servers: runtimeMcpServers,
+        hostApiToken: authToken,
+        bridgeApiUrl: paperclipBridge.env.PAPERCLIP_API_URL,
+        bridgeToken: paperclipBridge.env.PAPERCLIP_API_KEY,
+      });
+      const bearerConfig = await prepareOpenCodeRuntimeConfig({
+        env, config, runtimeMcpServers: bridgedServers,
+      });
+      runtimeConfigCleanups.push(bearerConfig.cleanup);
+      const localBearerConfigHome = bearerConfig.env.XDG_CONFIG_HOME;
+      if (!localBearerConfigHome) throw new Error("OpenCode runtime MCP config was not prepared.");
+      remoteConfigDir ??= expectedRemoteConfigDir(executionTarget, runId);
+      const staged = await prepareAdapterExecutionTargetRuntime({
+        runId,
+        target: executionTarget,
+        adapterKey: "opencode",
+        workspaceLocalDir: cwd,
+        workspaceRemoteDir: effectiveExecutionCwd,
+        syncWorkspace: false,
+        timeoutSec,
+        assets: [{ key: "xdgConfig", localDir: localBearerConfigHome }],
+      });
+      if (staged.assetDirs.xdgConfig !== remoteConfigDir) {
+        throw new Error("OpenCode runtime MCP config was not staged at the expected remote path.");
+      }
+      await runRemoteConfigCommand({
+        runId, target: executionTarget, configDir: remoteConfigDir,
+        action: "harden", cwd, timeoutSec, graceSec,
+      });
+      preparedRuntimeConfig.env.XDG_CONFIG_HOME = remoteConfigDir;
+      preparedRuntimeConfig.notes.push(`Injected ${runtimeMcpServers.length} Paperclip-managed OpenCode MCP server(s).`);
+    }
+    if (executionTarget?.kind === "remote" && runtimeMcpServers.length > 0) {
+      await ensureRemoteOpenCodeModelConfiguredAndAvailable({
+        runId,
+        executionTarget,
+        command,
+        model,
+        cwd,
+        env: preparedRuntimeConfig.env,
+        timeoutSec,
+        graceSec,
+        redact,
+      });
     }
 
     const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -837,8 +890,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     return toResult(initial);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (redact(message) !== message) throw new Error(redact(message));
+    throw error;
   } finally {
     let cleanupError: Error | null = null;
+    try {
+      await paperclipBridge?.stop();
+    } catch {
+      cleanupError = new Error("Failed to stop the OpenCode run bridge.");
+    }
     if (remoteConfigDir && executionTarget?.kind === "remote") {
       try {
         await runRemoteConfigCommand({
@@ -846,20 +908,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           action: "remove", cwd, timeoutSec, graceSec,
         });
       } catch {
-        cleanupError = new Error("Failed to remove staged OpenCode runtime config.");
+        cleanupError ??= new Error("Failed to remove staged OpenCode runtime config.");
       }
     }
     for (const cleanup of [
-      () => paperclipBridge?.stop(),
       () => restoreRemoteWorkspace?.(),
       () => localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }) : undefined,
-      () => preparedRuntimeConfig.cleanup(),
+      ...runtimeConfigCleanups.map((cleanup) => () => cleanup()),
     ]) {
       try {
         await cleanup();
       } catch {
         cleanupError ??= new Error("Failed to clean up OpenCode runtime assets.");
       }
+    }
+    try {
+      await logRedactor.flush();
+    } catch {
+      cleanupError ??= new Error("Failed to flush redacted OpenCode logs.");
     }
     if (cleanupError) throw cleanupError;
   }

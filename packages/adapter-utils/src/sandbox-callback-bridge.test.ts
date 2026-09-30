@@ -1377,6 +1377,7 @@ describe("sandbox callback bridge", () => {
   it("permits the documented heartbeat surface and denies unrelated routes", () => {
     const allowed: Array<{ method: string; path: string }> = [
       { method: "POST", path: "/runtime-tools/github/credentials" },
+      { method: "POST", path: "/api/mcp/project-tools" },
       { method: "GET", path: "/api/agents/me" },
       { method: "GET", path: "/api/agents/me/inbox-lite" },
       { method: "GET", path: "/api/agents/me/inbox/mine" },
@@ -1455,6 +1456,8 @@ describe("sandbox callback bridge", () => {
     }
 
     const denied: Array<{ method: string; path: string }> = [
+      { method: "GET", path: "/api/mcp/project-tools" },
+      { method: "POST", path: "/api/mcp/project-tools/other" },
       { method: "POST", path: "/api/companies/co-1/email/inboxes" },
       { method: "POST", path: "/api/companies/co-1/email/connections" },
       { method: "POST", path: "/api/companies/co-1/email/inspect" },

@@ -4,7 +4,7 @@
 
 ### Patch Changes
 
-- Inject Paperclip-managed remote MCP servers into a private per-run OpenCode config, clean staged credentials, and avoid resuming sessions with a changed MCP server set.
+- Inject Paperclip-managed remote MCP servers into a private per-run OpenCode config, route project tools through a revocable run bridge on remote targets, redact split bearer logs, clean staged credentials, and avoid resuming sessions with a changed MCP server set.
 
 ## 0.3.1
 

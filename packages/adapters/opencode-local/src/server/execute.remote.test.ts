@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -47,7 +48,7 @@ const {
   resolveCommandForLogs: vi.fn(async () => "ssh://fixture@127.0.0.1:2222/remote/workspace :: opencode"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
-  runSshCommand: vi.fn(async () => ({
+  runSshCommand: vi.fn(async (_spec?: unknown, _command?: string) => ({
     stdout: "/home/agent",
     stderr: "",
     exitCode: 0,
@@ -445,7 +446,7 @@ describe("opencode remote execution", () => {
     const workspaceDir = path.join(rootDir, "workspace");
     await mkdir(workspaceDir, { recursive: true });
     syncDirectoryToSsh.mockImplementationOnce(async () => undefined)
-      .mockRejectedValueOnce(new Error("synthetic partial upload"));
+      .mockRejectedValueOnce(new Error("synthetic partial upload partial-bearer"));
     await expect(execute({
       runId: "run-mcp-stage-fail",
       agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
@@ -460,12 +461,86 @@ describe("opencode remote execution", () => {
         privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
       } },
       onLog: async () => {},
-    })).rejects.toThrow("synthetic partial upload");
+    })).rejects.toThrow("synthetic partial upload ***REDACTED***");
     expect(runSshCommand).toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining("rm -rf -- '/remote/workspace/.paperclip-runtime/runs/run-mcp-stage-fail/workspace/.paperclip-runtime/opencode/xdgConfig'"),
       expect.anything(),
     );
     expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
+  it("strands only a stopped run bridge token when SSH cleanup becomes unreachable", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-project-bridge-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const agentJwt = "long-lived-project-jwt";
+    const bridgeToken = "run-scoped-bridge-token";
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+    const server = createServer((request, response) => {
+      response.statusCode = request.headers.authorization === `Bearer ${bridgeToken}` ? 200 : 401;
+      response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Bridge fixture did not listen.");
+    const bridgeApiUrl = `http://127.0.0.1:${address.port}`;
+    const stopBridge = vi.fn(async () => {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    });
+    startAdapterExecutionTargetPaperclipBridge.mockResolvedValueOnce({
+      env: { PAPERCLIP_API_URL: bridgeApiUrl, PAPERCLIP_API_KEY: bridgeToken, PAPERCLIP_API_BRIDGE_MODE: "queue_v1" },
+      stop: stopBridge,
+    });
+    let stagedConfig: Record<string, any> | null = null;
+    syncDirectoryToSsh.mockImplementationOnce(async () => undefined)
+      .mockImplementationOnce(async (input) => {
+        stagedConfig = JSON.parse(await readFile(path.join(input!.localDir, "opencode", "opencode.json"), "utf8"));
+        const live = await fetch(`${bridgeApiUrl}/api/mcp/project-tools`, {
+          method: "POST", headers: { Authorization: `Bearer ${bridgeToken}` },
+        });
+        expect(live.status).toBe(200);
+      });
+    runSshCommand.mockImplementation(async (_spec, command) => {
+      if (command?.includes("rm -rf --")) throw new Error("ssh disconnected");
+      return { stdout: "/home/agent", stderr: "", exitCode: 0 };
+    });
+    try {
+      await expect(execute({
+        runId: "run-project-bridge",
+        agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: "opencode", model: "opencode/gpt-5-nano", dangerouslySkipPermissions: false,
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        authToken: agentJwt,
+        runtimeMcp: { getServers: () => [{
+          name: "Paperclip projects", url: "https://paperclip.example.test/api/mcp/project-tools",
+          token: agentJwt, connectionId: "paperclip-project-tools",
+        }] },
+        executionTransport: { remoteExecution: {
+          host: "127.0.0.1", port: 2222, username: "fixture",
+          remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+        } },
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        onMeta: async (meta) => { metadata.push(meta); },
+      })).rejects.toThrow("Failed to remove staged OpenCode runtime config.");
+      expect((stagedConfig as { mcp: Record<string, unknown> } | null)?.mcp["Paperclip projects"]).toMatchObject({
+        url: `${bridgeApiUrl}/api/mcp/project-tools`,
+        headers: { Authorization: `Bearer ${bridgeToken}` },
+      });
+      expect(JSON.stringify(stagedConfig)).not.toContain(agentJwt);
+      expect(JSON.stringify({ logs, metadata, processCalls: runChildProcess.mock.calls })).not.toContain(agentJwt);
+      expect(JSON.stringify({ logs, metadata })).not.toContain(bridgeToken);
+      expect(stopBridge).toHaveBeenCalledTimes(1);
+      await expect(fetch(`${bridgeApiUrl}/api/mcp/project-tools`, {
+        method: "POST", headers: { Authorization: `Bearer ${bridgeToken}` },
+      })).rejects.toThrow();
+    } finally {
+      if (server.listening) await stopBridge();
+    }
   });
 });
