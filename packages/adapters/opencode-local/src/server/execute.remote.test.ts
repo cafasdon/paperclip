@@ -96,10 +96,20 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge,
+    prepareAdapterExecutionTargetRuntime: vi.fn(actual.prepareAdapterExecutionTargetRuntime),
   };
 });
 
+import { prepareAdapterExecutionTargetRuntime, type AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { execute } from "./execute.js";
+
+function debugConfigResult(config: unknown) {
+  return {
+    exitCode: 0, signal: null, timedOut: false,
+    stdout: JSON.stringify(config), stderr: "", pid: 122,
+    startedAt: new Date().toISOString(),
+  };
+}
 
 describe("opencode remote execution", () => {
   const cleanupDirs: string[] = [];
@@ -413,7 +423,10 @@ describe("opencode remote execution", () => {
       .mockImplementationOnce(async (input) => {
         stagedConfig = JSON.parse(await readFile(path.join(input!.localDir, "opencode", "opencode.json"), "utf8"));
       });
-    runChildProcess.mockRejectedValueOnce(new Error("remote OpenCode failed"));
+    runChildProcess.mockImplementationOnce(async (_runId, _command, args) => {
+      expect(args).toEqual(["debug", "config"]);
+      return debugConfigResult(stagedConfig);
+    }).mockRejectedValueOnce(new Error("remote OpenCode failed"));
     const configDir = "/remote/workspace/.paperclip-runtime/runs/run-mcp-ssh/workspace/.paperclip-runtime/opencode/xdgConfig";
     await expect(execute({
       runId: "run-mcp-ssh",
@@ -480,9 +493,55 @@ describe("opencode remote execution", () => {
     })).rejects.toThrow("synthetic partial upload ***REDACTED***");
     expect(runSshCommand).toHaveBeenCalledWith(
       expect.anything(),
-      expect.stringContaining("rm -rf -- '/remote/workspace/.paperclip-runtime/runs/run-mcp-stage-fail/workspace/.paperclip-runtime/opencode/xdgConfig'"),
+      expect.stringContaining("rm -rf -- '/remote/workspace/.paperclip-runtime/runs/run-mcp-stage-fail/workspace/.paperclip-runtime/opencode/xdgConfig' '/remote/workspace/.paperclip-runtime/runs/run-mcp-stage-fail/workspace/.paperclip-runtime/opencode/xdgConfig-upload.tar'"),
       expect.anything(),
     );
+    expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
+  it("removes the credential archive when sandbox asset extraction fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-sandbox-extract-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const runtimeRootDir = "/remote/workspace/.paperclip-runtime/opencode";
+    const remoteConfigDir = `${runtimeRootDir}/xdgConfig`;
+    const uploadTar = `${remoteConfigDir}-upload.tar`;
+    const remoteFiles = new Set<string>();
+    const commands: string[] = [];
+    const target: AdapterExecutionTarget = {
+      kind: "remote", transport: "sandbox", providerKey: "fixture", remoteCwd: "/remote/workspace",
+      runner: { execute: async ({ args }) => {
+        const command = args?.join(" ") ?? "";
+        commands.push(command);
+        if (command.includes("rm -rf --") && command.includes(uploadTar)) remoteFiles.delete(uploadTar);
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "/usr/bin/opencode", stderr: "", pid: null, startedAt: new Date().toISOString() };
+      } },
+    };
+    vi.mocked(prepareAdapterExecutionTargetRuntime)
+      .mockResolvedValueOnce({
+        target, workspaceRemoteDir: "/remote/workspace", runtimeRootDir,
+        assetDirs: { skills: `${runtimeRootDir}/skills` },
+        additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
+        restoreWorkspace: async () => {},
+      })
+      .mockImplementationOnce(async () => {
+        remoteFiles.add(uploadTar);
+        throw new Error("synthetic sandbox tar extraction failed");
+      });
+    await expect(execute({
+      runId: "run-sandbox-extract-fail",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "opencode", model: "opencode/gpt-5-nano", dangerouslySkipPermissions: false,
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      runtimeMcp: { getServers: () => [{ name: "research", url: "https://mcp.example.test/mcp", token: "synthetic-bearer", connectionId: "connection-1" }] },
+      executionTarget: target,
+      onLog: async () => {},
+    })).rejects.toThrow("synthetic sandbox tar extraction failed");
+    expect(commands.some((command) => command.includes("rm -rf --") && command.includes(remoteConfigDir) && command.includes(uploadTar))).toBe(true);
+    expect(remoteFiles.has(uploadTar)).toBe(false);
     expect(runChildProcess).not.toHaveBeenCalled();
   });
 
@@ -519,6 +578,10 @@ describe("opencode remote execution", () => {
         });
         expect(live.status).toBe(200);
       });
+    runChildProcess.mockImplementationOnce(async (_runId, _command, args) => {
+      expect(args).toEqual(["debug", "config"]);
+      return debugConfigResult(stagedConfig);
+    });
     runSshCommand.mockImplementation(async (_spec, command) => {
       if (command?.includes("rm -rf --")) throw new Error("ssh disconnected");
       return { stdout: "/home/agent", stderr: "", exitCode: 0 };

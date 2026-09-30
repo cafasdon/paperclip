@@ -11,9 +11,42 @@ type PreparedOpenCodeRuntimeConfig = {
   notes: string[];
   cleanup: () => Promise<void>;
   managedMcpOverlayContentForHome?: (configHome: string) => string;
+  managedMcpBindings?: ManagedOpenCodeMcpServer[];
 };
 
-type ManagedOpenCodeMcpServer = { name: string; url: string; token: string };
+export type ManagedOpenCodeMcpServer = { name: string; url: string; token: string };
+
+const EFFECTIVE_MCP_ERROR = "OpenCode effective managed MCP configuration could not be verified.";
+
+/** Fail closed if a later OpenCode config layer changed a managed endpoint or bearer. */
+export function assertOpenCodeManagedMcpBindings(
+  rawConfig: string,
+  expected: ManagedOpenCodeMcpServer[],
+): void {
+  let config: unknown;
+  try {
+    config = JSON.parse(rawConfig);
+  } catch {
+    throw new Error(EFFECTIVE_MCP_ERROR);
+  }
+  const mcp = isPlainObject(config) && isPlainObject(config.mcp) ? config.mcp : null;
+  if (!mcp) throw new Error(EFFECTIVE_MCP_ERROR);
+  for (const { name, url, token } of expected) {
+    const entry = mcp[name];
+    if (!isPlainObject(entry) || !isPlainObject(entry.headers)) {
+      throw new Error(EFFECTIVE_MCP_ERROR);
+    }
+    const authorization = Object.entries(entry.headers)
+      .filter(([key]) => key.toLowerCase() === "authorization")
+      .map(([, value]) => value);
+    if (
+      entry.type !== "remote" || entry.enabled !== true || entry.oauth !== false || entry.url !== url
+      || authorization.length !== 1 || authorization[0] !== `Bearer ${token}`
+    ) {
+      throw new Error(EFFECTIVE_MCP_ERROR);
+    }
+  }
+}
 
 /** Session identity excludes bearer tokens and is stable across server ordering. */
 export function openCodeMcpServerIdentity(servers: AdapterRuntimeMcpServer[]): string {
@@ -243,9 +276,10 @@ function mergeConfigObjects(
 function rejectLaterOpenCodeConfig(env: Record<string, string>): void {
   // OpenCode loads these after XDG_CONFIG_HOME. A later MCP entry can replace
   // only the URL and inherit our Authorization header, redirecting the bearer.
-  for (const name of ["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT"]) {
-    if ((env[name] ?? process.env[name])?.trim()) {
-      throw new Error(`Paperclip-managed OpenCode MCP cannot use ${name}.`);
+  const blocked = new Set(["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_TEST_MANAGED_CONFIG_DIR"]);
+  for (const [name, value] of Object.entries({ ...process.env, ...env })) {
+    if (blocked.has(name.toUpperCase()) && typeof value === "string" && value.trim()) {
+      throw new Error(`Paperclip-managed OpenCode MCP cannot use ${name.toUpperCase()}.`);
     }
   }
 }
@@ -446,6 +480,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
         await fs.rm(runtimeConfigHome, { recursive: true, force: true });
       },
       managedMcpOverlayContentForHome: overlayForHome,
+      managedMcpBindings: managed,
     };
   } catch (error) {
     await fs.rm(runtimeConfigHome, { recursive: true, force: true });

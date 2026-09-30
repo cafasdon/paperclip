@@ -59,7 +59,7 @@ import {
   requireOpenCodeModelId,
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
-import { openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes, routeRemoteProjectToolsMcpThroughBridge } from "./runtime-config.js";
+import { assertOpenCodeManagedMcpBindings, openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes, routeRemoteProjectToolsMcpThroughBridge, type ManagedOpenCodeMcpServer } from "./runtime-config.js";
 import { createStreamingSecretRedactor } from "./secret-redactor.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
@@ -98,7 +98,10 @@ async function runRemoteConfigCommand(input: {
     ? `chmod 700 ${shellQuote(input.configDir)} ${shellQuote(configFileDir)} && ` +
       `chmod 600 ${shellQuote(configPath)} && ` +
       `find ${shellQuote(configFileDir)} -maxdepth 1 -type f -name 'paperclip-managed-mcp-*' -exec chmod 600 -- {} +`
-    : `rm -rf -- ${shellQuote(input.configDir)}`;
+    // Sandbox asset extraction may fail after its sibling upload archive was
+    // written but before the staging command deleted it. Remove both owned
+    // paths even when the asset stage itself never returned.
+    : `rm -rf -- ${shellQuote(input.configDir)} ${shellQuote(`${input.configDir}-upload.tar`)}`;
   const result = await runAdapterExecutionTargetShellCommand(input.runId, input.target, command, {
     cwd: input.cwd,
     env: {},
@@ -133,6 +136,41 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
 
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
+
+async function verifyEffectiveOpenCodeManagedMcp(input: {
+  runId: string;
+  executionTarget: AdapterExecutionContext["executionTarget"];
+  command: string;
+  cwd: string;
+  env: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+  bindings: ManagedOpenCodeMcpServer[];
+}): Promise<void> {
+  const failure = () => new Error("OpenCode effective managed MCP configuration could not be verified.");
+  if (input.bindings.length === 0) throw failure();
+  const maximum = input.executionTarget?.kind === "remote" && input.executionTarget.transport === "sandbox"
+    ? 90 : 30;
+  try {
+    // `debug config` resolves every OpenCode layer, including system-managed
+    // and organisation policy loaded after OPENCODE_CONFIG_CONTENT. Keep its
+    // complete output private: it can contain provider keys and MCP bearers.
+    const probe = await runAdapterExecutionTargetProcess(
+      input.runId, input.executionTarget, input.command, ["debug", "config"], {
+        cwd: input.cwd,
+        env: input.env,
+        timeoutSec: input.timeoutSec > 0 ? Math.min(input.timeoutSec, maximum) : maximum,
+        graceSec: Math.min(input.graceSec, 5),
+        onLog: async () => {},
+      },
+    );
+    if (probe.timedOut || probe.exitCode !== 0) throw failure();
+    assertOpenCodeManagedMcpBindings(probe.stdout, input.bindings);
+  } catch {
+    // Tool/transport failures and parser diagnostics may contain secrets.
+    throw failure();
+  }
+}
 
 export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   runId: string;
@@ -387,6 +425,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env, config, runtimeMcpServers: executionTargetIsRemote ? [] : runtimeMcpServers,
   });
   const runtimeConfigCleanups = [preparedRuntimeConfig.cleanup];
+  let managedMcpBindings = preparedRuntimeConfig.managedMcpBindings ?? [];
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
@@ -587,6 +626,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const bearerConfig = await prepareOpenCodeRuntimeConfig({
         env, config, runtimeMcpServers: bridgedServers,
       });
+      managedMcpBindings = bearerConfig.managedMcpBindings ?? [];
       runtimeConfigCleanups.push(bearerConfig.cleanup);
       const localBearerConfigHome = bearerConfig.env.XDG_CONFIG_HOME;
       if (!localBearerConfigHome) throw new Error("OpenCode runtime MCP config was not prepared.");
@@ -768,6 +808,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     const runAttempt = async (resumeSessionId: string | null) => {
+      if (runtimeMcpServers.length > 0) {
+        await verifyEffectiveOpenCodeManagedMcp({
+          runId, executionTarget: runtimeExecutionTarget, command, cwd,
+          env: preparedRuntimeConfig.env, timeoutSec, graceSec,
+          bindings: managedMcpBindings,
+        });
+      }
       const { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
       const prompt = joinPromptSections([
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),

@@ -1044,6 +1044,10 @@ config layer, so a home OpenCode config cannot redirect a managed bearer.
 For permissions-enforced SSH runs, this layer preserves the remote user's
 OpenCode provider and permission config while reading managed endpoints and
 bearers from private per-run files.
+Before each managed run, Paperclip checks the effective OpenCode config in the
+same execution environment and stops if any managed endpoint or bearer has
+changed. This check is a point-in-time guard; a trusted host or organisation
+administrator can change policy after it runs.
 
 Responses may contain secret IDs, version selectors, header names, prefixes,
 scope names, expiry timestamps, and redacted provider metadata. They must not

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, routeRemoteProjectToolsMcpThroughBridge } from "./runtime-config.js";
+import { assertOpenCodeManagedMcpBindings, openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, routeRemoteProjectToolsMcpThroughBridge } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -35,6 +35,32 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     { name: "research", url: "https://mcp.example.test/mcp", token: "test-bearer-secret", connectionId: "connection-1" },
     { name: "research", url: "https://mcp2.example.test/mcp", token: "other-test-secret", connectionId: "connection-2" },
   ];
+
+  it("verifies every effective managed URL and bearer without echoing a secret on failure", () => {
+    const expected = [
+      { name: "research", url: "https://mcp.example.test/mcp", token: "test-bearer-secret" },
+      { name: "ops", url: "https://ops.example.test/mcp", token: "other-test-secret" },
+    ];
+    const good = { mcp: {
+      research: { type: "remote", url: expected[0]!.url, enabled: true, oauth: false,
+        headers: { Authorization: `Bearer ${expected[0]!.token}` } },
+      ops: { type: "remote", url: expected[1]!.url, enabled: true, oauth: false,
+        headers: { Authorization: `Bearer ${expected[1]!.token}` } },
+    } };
+    expect(() => assertOpenCodeManagedMcpBindings(JSON.stringify(good), expected)).not.toThrow();
+    for (const bad of [
+      "not-json",
+      JSON.stringify({ mcp: { research: good.mcp.research } }),
+      JSON.stringify({ mcp: { ...good.mcp, ops: { ...good.mcp.ops, url: "https://redirect.example.test/mcp" } } }),
+      JSON.stringify({ mcp: { ...good.mcp, research: { ...good.mcp.research,
+        headers: { Authorization: `Bearer ${expected[0]!.token}`, authorization: "Bearer other" } } } }),
+    ]) {
+      expect(() => assertOpenCodeManagedMcpBindings(bad, expected))
+        .toThrow("OpenCode effective managed MCP configuration could not be verified.");
+      try { assertOpenCodeManagedMcpBindings(bad, expected); }
+      catch (error) { expect(String(error)).not.toContain("test-bearer-secret"); }
+    }
+  });
 
   it("preserves user config and writes managed remote MCP servers in a private per-run config", async () => {
     const source = { theme: "system", permission: { read: "ask" }, mcp: { research: { type: "local", command: ["fixture"] } } };
@@ -168,6 +194,14 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       env: { XDG_CONFIG_HOME: configHome, OPENCODE_CONFIG_CONTENT: '{"mcp":{"research":{"url":"https://untrusted.example.test/mcp"}}}' },
       config: { dangerouslySkipPermissions: false }, runtimeMcpServers: [managedServers[0]!],
     })).rejects.toThrow("cannot use OPENCODE_CONFIG_CONTENT");
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, OPENCODE_TEST_MANAGED_CONFIG_DIR: "/tmp/untrusted" },
+      config: { dangerouslySkipPermissions: false }, runtimeMcpServers: [managedServers[0]!],
+    })).rejects.toThrow("cannot use OPENCODE_TEST_MANAGED_CONFIG_DIR");
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, opencode_test_managed_config_dir: "/tmp/untrusted" },
+      config: { dangerouslySkipPermissions: false }, runtimeMcpServers: [managedServers[0]!],
+    })).rejects.toThrow("cannot use OPENCODE_TEST_MANAGED_CONFIG_DIR");
   });
 
   it("fails closed on malformed config or MCP server and leaves no runtime config", async () => {
