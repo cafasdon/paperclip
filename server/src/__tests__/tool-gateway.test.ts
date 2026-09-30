@@ -52,7 +52,7 @@ import {
   signToolArguments,
   summarizeToolValue,
 } from "../services/tool-content-guards.js";
-import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
+import { createToolGatewayService, remoteMcpToolTimeoutMs, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import type { ComposioClient } from "../services/composio.js";
 import { secretService } from "../services/secrets.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
@@ -536,6 +536,17 @@ async function startFakeRemoteMcpServer(handler: (request: FakeMcpRequest) => Pr
     }),
   };
 }
+
+describe("remote MCP tool timeout", () => {
+  it("keeps the 10-second default and bounds the connection setting to 1–60 seconds", () => {
+    expect(remoteMcpToolTimeoutMs({})).toBe(10_000);
+    expect(remoteMcpToolTimeoutMs({ remoteMcpToolTimeoutMs: 60_000 })).toBe(60_000);
+    expect(remoteMcpToolTimeoutMs({ remoteMcpToolTimeoutMs: 500 })).toBe(1_000);
+    expect(remoteMcpToolTimeoutMs({ remoteMcpToolTimeoutMs: 90_000 })).toBe(60_000);
+    expect(remoteMcpToolTimeoutMs({ remoteMcpToolTimeoutMs: "60000" })).toBe(10_000);
+    expect(remoteMcpToolTimeoutMs({ remoteMcpToolTimeoutMs: 60_000 }, 2_000)).toBe(2_000);
+  });
+});
 
 describeEmbeddedPostgres("tool gateway acceptance", () => {
   let db!: Db;
@@ -4032,6 +4043,142 @@ rl.on("line", (line) => {
       });
       expect(persisted).not.toContain(originalCredential);
       expect(persisted).not.toContain(rotatedCredential);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it.each(["managed", "test"] as const)(
+    "uses the remote connection timeout for %s tools/call without weakening policy or audit",
+    async (path) => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const userId = `timeout-test-${randomUUID()}`;
+      await createActiveMember(db, company.id, userId);
+      const fake = await startFakeRemoteMcpServer(() => ({ delayMs: 1_500 }));
+      try {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
+          url: fake.url,
+          riskLevel: "read",
+          connectionConfig: { remoteMcpToolTimeoutMs: 1_000 },
+        });
+        const profile = await allowAllToolsForAgent(db, company.id, agent.id);
+        const gateway = createTestToolGatewayService(db);
+        if (path === "managed") {
+          const namedGateway = await gateway.createNamedGateway({
+            companyId: company.id,
+            body: { name: "Timeout fixture", profileId: profile.id, defaultProfileMode: "gateway_only" },
+          });
+          const token = await gateway.createNamedGatewayToken({
+            companyId: company.id,
+            gatewayId: namedGateway.id,
+            body: {
+              name: "Run token",
+              subjectType: "heartbeat_run",
+              subjectId: run.id,
+              clientLabel: "Managed agent",
+              allowedActions: ["tools/list", "tools/call"],
+              expiresAt: new Date(Date.now() + 60_000),
+            },
+            actor: { agentId: agent.id },
+          });
+          const tool = (await gateway.listToolsForNamedGateway({
+            gatewayId: namedGateway.id,
+            bearerToken: token.token,
+          })).find(
+            (candidate) => candidate.connectionId === remoteTool.connection.id,
+          );
+          expect(tool).toBeDefined();
+          const response = await request(createGatewayRouteApp(db, gateway))
+            .post(namedGateway.endpointPath)
+            .set("authorization", `Bearer ${token.token}`)
+            .send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+              name: tool!.name,
+              arguments: { key: "alpha", value: "one" },
+            } });
+          expect(response.status).toBe(504);
+          expect(response.body.error.data.reasonCode).toBe("tool_timeout");
+        } else {
+          await expect(gateway.executeTestCall({
+            companyId: company.id,
+            connectionId: remoteTool.connection.id,
+            agentId: agent.id,
+            userId,
+            toolName: "kv_set",
+            parameters: { key: "alpha", value: "one" },
+          })).resolves.toMatchObject({
+            decision: "allowed",
+            error: { reasonCode: "tool_timeout" },
+          });
+        }
+
+        expect(fake.requests).toHaveLength(1);
+        const [invocation] = await db.select().from(toolInvocations);
+        expect(invocation).toMatchObject({ status: "timed_out", errorCode: "tool_timeout" });
+        const [event] = await db.select().from(toolCallEvents).where(eq(toolCallEvents.eventType, "call_failed"));
+        expect(event).toMatchObject({ outcome: "timeout", reasonCode: "tool_timeout" });
+        const [allowedAudit] = await db.select().from(activityLog).where(eq(activityLog.action, "tool_gateway.call_allowed"));
+        expect(allowedAudit).toBeDefined();
+      } finally {
+        await fake.close();
+      }
+    },
+    10_000,
+  );
+
+  it("keeps successful managed and Test calls unchanged without a connection timeout", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const userId = `timeout-default-${randomUUID()}`;
+    await createActiveMember(db, company.id, userId);
+    const fake = await startFakeRemoteMcpServer(() => ({ delayMs: 50 }));
+    try {
+      const remoteTool = await createRemoteMcpTool(db, company.id, { url: fake.url, riskLevel: "read" });
+      const profile = await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const namedGateway = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: { name: "Default timeout fixture", profileId: profile.id, defaultProfileMode: "gateway_only" },
+      });
+      const token = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: {
+          name: "Run token",
+          subjectType: "heartbeat_run",
+          subjectId: run.id,
+          clientLabel: "Managed agent",
+          allowedActions: ["tools/list", "tools/call"],
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+        actor: { agentId: agent.id },
+      });
+      const tool = (await gateway.listToolsForNamedGateway({
+        gatewayId: namedGateway.id,
+        bearerToken: token.token,
+      })).find(
+        (candidate) => candidate.connectionId === remoteTool.connection.id,
+      );
+      expect(tool).toBeDefined();
+      const managed = await request(createGatewayRouteApp(db, gateway))
+        .post(namedGateway.endpointPath)
+        .set("authorization", `Bearer ${token.token}`)
+        .send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+          name: tool!.name,
+          arguments: { key: "alpha", value: "one" },
+        } });
+      expect(managed.status).toBe(200);
+      await expect(gateway.executeTestCall({
+        companyId: company.id,
+        connectionId: remoteTool.connection.id,
+        agentId: agent.id,
+        userId,
+        toolName: "kv_set",
+        parameters: { key: "alpha", value: "two" },
+      })).resolves.toMatchObject({ decision: "allowed", result: { content: "ok" } });
+      expect(fake.requests).toHaveLength(2);
     } finally {
       await fake.close();
     }

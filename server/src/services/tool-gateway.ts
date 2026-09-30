@@ -648,6 +648,23 @@ function timeoutMs(value: number | undefined) {
   );
 }
 
+export function remoteMcpToolTimeoutMs(
+  config: Record<string, unknown>,
+  requestedTimeoutMs?: number,
+): number {
+  // An explicit gateway request keeps its existing timeout semantics. Managed
+  // MCP clients and the connector Test call omit it and use this connection's
+  // configured default instead. Tool arguments are never consulted here.
+  if (typeof requestedTimeoutMs === "number" && Number.isFinite(requestedTimeoutMs)) {
+    return timeoutMs(requestedTimeoutMs);
+  }
+  const configured = config.remoteMcpToolTimeoutMs;
+  if (typeof configured !== "number" || !Number.isFinite(configured)) {
+    return DEFAULT_TOOL_TIMEOUT_MS;
+  }
+  return Math.max(1_000, Math.min(60_000, Math.floor(configured)));
+}
+
 function sessionTtlMs(value: number | undefined) {
   if (!Number.isFinite(value)) return DEFAULT_SESSION_TTL_MS;
   return Math.max(
@@ -5738,7 +5755,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
     parameters: unknown,
-    ms: number,
+    requestedTimeoutMs: number | undefined,
     invocationId: string,
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
   ): Promise<RemoteHttpExecutionResult> {
@@ -5746,6 +5763,7 @@ export function createToolGatewayService(
       session,
       tool,
     );
+    const ms = remoteMcpToolTimeoutMs(connection.config, requestedTimeoutMs);
     const grant = await resolveConnectionGrant(session, connection);
     const composioScopeRevision = `${grant.id}:${grant.status}:${grant.updatedAt.toISOString()}`;
     const composioChild = composioChildConfig(connection);
@@ -6977,7 +6995,7 @@ export function createToolGatewayService(
               args.session,
               args.tool,
               args.parameters,
-              executionTimeoutMs,
+              args.timeoutMs,
               args.invocationId,
             )
           : args.tool.providerType === "mcp_local_stdio"
@@ -10209,7 +10227,7 @@ export function createToolGatewayService(
                 session,
                 tool,
                 effectiveParameters,
-                executionTimeoutMs,
+                input.timeoutMs,
                 invocationId,
                 input.callerHeaders,
               )
