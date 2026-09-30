@@ -1,5 +1,11 @@
 # @paperclipai/adapter-opencode-local
 
+## Unreleased
+
+### Patch Changes
+
+- Inject Paperclip-managed remote MCP servers into a private per-run OpenCode config, clean staged credentials, and avoid resuming sessions with a changed MCP server set.
+
 ## 0.3.1
 
 ### Patch Changes
