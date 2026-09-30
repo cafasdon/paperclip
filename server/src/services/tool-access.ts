@@ -2392,6 +2392,13 @@ export function classifyRisk(
     return "write";
   if (annotations.readOnlyHint === false || annotations.writeHint === true)
     return "write";
+  // Docker MCP Gateway omits readOnlyHint=false from this broker tool. Its
+  // name still identifies a vault mutation even when the hint is lost.
+  if (
+    normalizedToolName === "vault-restore" ||
+    normalizedToolName.endsWith("-vault-restore")
+  )
+    return "write";
   if (
     sourceTemplateKey === "notion" &&
     NOTION_READ_TOOLS.has(normalizedToolName)
