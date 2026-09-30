@@ -54,11 +54,11 @@ describe("prepareOpenCodeRuntimeConfig", () => {
         research: source.mcp.research,
         "research-connecti": {
           type: "remote", url: managedServers[0]!.url, enabled: true, oauth: false,
-          headers: { Authorization: "Bearer test-bearer-secret" }, timeout: 30_000,
+          headers: { Authorization: "Bearer test-bearer-secret" }, timeout: 75_000,
         },
         "research-connecti-2": {
           type: "remote", url: managedServers[1]!.url, enabled: true, oauth: false,
-          headers: { Authorization: "Bearer other-test-secret" }, timeout: 30_000,
+          headers: { Authorization: "Bearer other-test-secret" }, timeout: 75_000,
         },
       },
     });
@@ -86,6 +86,51 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(JSON.parse(await fs.readFile(sourcePath, "utf8"))).toEqual({ theme: "linked" });
     expect((await fs.lstat(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"))).isSymbolicLink()).toBe(false);
     await prepared.cleanup();
+  });
+
+  it("collapses later JSONC config before allocating managed names so a bearer cannot follow an overridden URL", async () => {
+    const configHome = await makeConfigHome();
+    const configDir = path.join(configHome, "opencode");
+    const commentedJson = '{\n // OpenCode accepts comments in .json too\n "theme": "system",\n}\n';
+    const laterJsonc = '{\n "mcp": { "research": { "type": "remote", "url": "https://untrusted.example.test/mcp" } },\n}\n';
+    await fs.writeFile(path.join(configDir, "config.json"), '{ "permission": { "read": "ask" } }');
+    await fs.writeFile(path.join(configDir, "opencode.json"), commentedJson);
+    await fs.writeFile(path.join(configDir, "opencode.jsonc"), laterJsonc);
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome }, config: { dangerouslySkipPermissions: false },
+      runtimeMcpServers: [managedServers[0]!],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeDir = path.join(prepared.env.XDG_CONFIG_HOME, "opencode");
+    const effective = JSON.parse(await fs.readFile(path.join(runtimeDir, "opencode.json"), "utf8"));
+    expect(effective).toMatchObject({
+      theme: "system",
+      permission: { read: "ask" },
+      mcp: {
+        research: { url: "https://untrusted.example.test/mcp" },
+        "research-connecti": {
+          url: managedServers[0]!.url,
+          headers: { Authorization: `Bearer ${managedServers[0]!.token}` },
+          timeout: 75_000,
+        },
+      },
+    });
+    expect(effective.mcp.research.headers).toBeUndefined();
+    await expect(fs.access(path.join(runtimeDir, "opencode.jsonc"))).rejects.toThrow();
+    await expect(fs.access(path.join(runtimeDir, "config.json"))).rejects.toThrow();
+    expect(await fs.readFile(path.join(configDir, "opencode.json"), "utf8")).toBe(commentedJson);
+    expect(await fs.readFile(path.join(configDir, "opencode.jsonc"), "utf8")).toBe(laterJsonc);
+    expect(prepared.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe("true");
+    await prepared.cleanup();
+  });
+
+  it("rejects later OpenCode config overrides while managed bearer credentials are present", async () => {
+    const configHome = await makeConfigHome();
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, OPENCODE_CONFIG_CONTENT: '{"mcp":{"research":{"url":"https://untrusted.example.test/mcp"}}}' },
+      config: { dangerouslySkipPermissions: false }, runtimeMcpServers: [managedServers[0]!],
+    })).rejects.toThrow("cannot use OPENCODE_CONFIG_CONTENT");
   });
 
   it("fails closed on malformed config or MCP server and leaves no runtime config", async () => {

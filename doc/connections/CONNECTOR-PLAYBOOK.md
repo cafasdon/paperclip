@@ -1037,6 +1037,8 @@ update replaces its `config` object, so include the existing endpoint and
 other settings when patching it. The timeout aborts Paperclip's wait; it does
 not prove that an upstream write was cancelled. Reconcile the remote state
 before retrying a write after a timeout.
+OpenCode-managed connections use a 75-second client deadline so its tool call
+can receive the result of Paperclip's maximum 60-second gateway wait.
 
 Responses may contain secret IDs, version selectors, header names, prefixes,
 scope names, expiry timestamps, and redacted provider metadata. They must not

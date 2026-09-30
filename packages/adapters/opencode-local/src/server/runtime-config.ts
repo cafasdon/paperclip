@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 
@@ -86,7 +87,9 @@ function managedMcpEntries(
       enabled: true,
       oauth: false,
       headers: { Authorization: `Bearer ${server.token}` },
-      timeout: 30_000,
+      // The gateway permits up to 60 seconds for a remote MCP call. OpenCode
+      // also uses this timeout for tools/call, so leave room for gateway overhead.
+      timeout: 75_000,
     };
   }
   return mcp;
@@ -185,13 +188,37 @@ async function readJsonObject(filepath: string, requireValid: boolean): Promise<
     return {};
   }
   try {
-    const parsed = JSON.parse(raw);
-    if (isPlainObject(parsed)) return parsed;
+    const errors: ParseError[] = [];
+    const parsed: unknown = parseJsonc(raw, errors, { allowTrailingComma: true });
+    if (errors.length === 0 && isPlainObject(parsed)) return parsed;
   } catch {
     // Preserve legacy fallback only when no managed MCP servers need injection.
   }
   if (requireValid) throw new Error("Existing OpenCode config is not a JSON object.");
   return {};
+}
+
+function mergeConfigObjects(
+  previous: Record<string, unknown>,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = Object.assign(Object.create(null), previous);
+  for (const [key, value] of Object.entries(next)) {
+    merged[key] = isPlainObject(merged[key]) && isPlainObject(value)
+      ? mergeConfigObjects(merged[key], value)
+      : value;
+  }
+  return merged;
+}
+
+function rejectLaterOpenCodeConfig(env: Record<string, string>): void {
+  // OpenCode loads these after XDG_CONFIG_HOME. A later MCP entry can replace
+  // only the URL and inherit our Authorization header, redirecting the bearer.
+  for (const name of ["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT"]) {
+    if ((env[name] ?? process.env[name])?.trim()) {
+      throw new Error(`Paperclip-managed OpenCode MCP cannot use ${name}.`);
+    }
+  }
 }
 
 export async function prepareOpenCodeRuntimeConfig(input: {
@@ -231,6 +258,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
   const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
   try {
+    if (runtimeMcpServers.length > 0) rejectLaterOpenCodeConfig(input.env);
     await fs.mkdir(runtimeConfigDir, { recursive: true, mode: 0o700 });
     try {
       await fs.cp(sourceConfigDir, runtimeConfigDir, {
@@ -245,7 +273,22 @@ export async function prepareOpenCodeRuntimeConfig(input: {
       }
     }
 
-    const existingConfig = await readJsonObject(runtimeConfigPath, runtimeMcpServers.length > 0);
+    // OpenCode loads these in order. Collapse them into one private per-run file
+    // before adding credentials, so a copied opencode.jsonc cannot override only
+    // a managed endpoint while keeping its Authorization header.
+    const globalConfigPaths = ["config.json", "opencode.json", "opencode.jsonc"]
+      .map((name) => path.join(runtimeConfigDir, name));
+    const existingConfig = runtimeMcpServers.length > 0
+      ? (await Promise.all(globalConfigPaths.map((filepath) => readJsonObject(filepath, true))))
+        .reduce(mergeConfigObjects, {})
+      : await readJsonObject(runtimeConfigPath, false);
+    if (runtimeMcpServers.length > 0) {
+      for (const filepath of [globalConfigPaths[0]!, globalConfigPaths[2]!]) {
+        await fs.unlink(filepath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+      }
+    }
     // A copied user config may be a symlink. Replace it in the temporary tree
     // before writing so the source config is never modified through that link.
     if ((await fs.lstat(runtimeConfigPath).catch(() => null))?.isSymbolicLink()) {
@@ -340,6 +383,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
       env: {
         ...input.env,
         XDG_CONFIG_HOME: runtimeConfigHome,
+        ...(runtimeMcpServers.length > 0 ? { OPENCODE_DISABLE_PROJECT_CONFIG: "true" } : {}),
       },
       notes,
       cleanup: async () => {
