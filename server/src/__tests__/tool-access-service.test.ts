@@ -17736,6 +17736,7 @@ describe("classifyRisk", () => {
     expect(risk("update_zap")).toBe("write");
     expect(risk("send_message")).toBe("write");
     expect(risk("set_value")).toBe("write");
+    expect(risk("vault_restore", { destructiveHint: false })).toBe("write");
   });
 
   it("classifies namespaced write verbs as write (PAP-10902)", () => {
@@ -17745,6 +17746,7 @@ describe("classifyRisk", () => {
     expect(risk("github:create_issue")).toBe("write");
     expect(risk("notion:update_page")).toBe("write");
     expect(risk("linear:create_issue")).toBe("write");
+    expect(risk("bitwarden:vault_restore", { destructiveHint: false })).toBe("write");
   });
 
   it("classifies camelCase write verbs as write", () => {
@@ -17767,10 +17769,12 @@ describe("classifyRisk", () => {
     // Verbs embedded mid-word must not trigger (no segment boundary).
     expect(risk("settings")).toBe("read");
     expect(risk("dataset_export")).toBe("read");
+    expect(risk("vault_restore_status")).toBe("read");
   });
 
   it("honours explicit annotation hints over name heuristics", () => {
     expect(risk("list_items", { destructiveHint: true })).toBe("destructive");
+    expect(risk("run_with_secrets", { destructiveHint: true })).toBe("destructive");
     expect(risk("list_items", { writeHint: true })).toBe("write");
     expect(risk("list_items", { readOnlyHint: false })).toBe("write");
   });
