@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import { openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, routeRemoteProjectToolsMcpThroughBridge } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -107,6 +107,28 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(openCodeMcpServerIdentity([{ ...managedServers[0]!, token: "rotated" }, managedServers[1]!])).toBe(identity);
     expect(openCodeMcpServerIdentity([managedServers[0]!])).not.toBe(identity);
     expect(identity).not.toContain("test-bearer-secret");
+  });
+
+  it("routes the long-lived project JWT through the run bridge and fails closed on a mismatch", () => {
+    const project = {
+      name: "Paperclip projects", url: "https://paperclip.example.test/api/mcp/project-tools",
+      token: "host-only-jwt", connectionId: "paperclip-project-tools",
+    };
+    const options = {
+      servers: [project, managedServers[0]!], hostApiToken: "host-only-jwt",
+      bridgeApiUrl: "http://127.0.0.1:4310", bridgeToken: "run-bridge-token",
+    };
+    expect(routeRemoteProjectToolsMcpThroughBridge(options)).toEqual([
+      { ...project, url: "http://127.0.0.1:4310/api/mcp/project-tools", token: "run-bridge-token" },
+      managedServers[0],
+    ]);
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, bridgeToken: "" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, bridgeToken: "host-only-jwt" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, bridgeApiUrl: "https://other.example.test" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, hostApiToken: "wrong" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({
+      ...options, servers: [{ ...project, url: "https://paperclip.example.test/api/other" }],
+    })).toThrow("run bridge");
   });
 
   it("allows all tools and connected tools by default", async () => {

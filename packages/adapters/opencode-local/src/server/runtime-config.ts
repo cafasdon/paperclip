@@ -19,6 +19,41 @@ export function openCodeMcpServerIdentity(servers: AdapterRuntimeMcpServer[]): s
   return `sha256:${createHash("sha256").update(JSON.stringify(descriptors)).digest("hex")}`;
 }
 
+/** Keep the long-lived agent JWT on the host; the remote file gets only the live bridge credential. */
+export function routeRemoteProjectToolsMcpThroughBridge(input: {
+  servers: AdapterRuntimeMcpServer[];
+  hostApiToken: string | null | undefined;
+  bridgeApiUrl: string | undefined;
+  bridgeToken: string | undefined;
+}): AdapterRuntimeMcpServer[] {
+  return input.servers.map((server) => {
+    if (server.connectionId !== "paperclip-project-tools") return server;
+    let endpoint: URL;
+    let bridge: URL;
+    try {
+      endpoint = new URL(server.url);
+      bridge = new URL(input.bridgeApiUrl ?? "");
+    } catch {
+      throw new Error("Cannot route Paperclip project tools through the run bridge.");
+    }
+    if (
+      !input.hostApiToken || server.token !== input.hostApiToken
+      || !input.bridgeToken || input.bridgeToken === input.hostApiToken
+      || !["http:", "https:"].includes(bridge.protocol)
+      || !["127.0.0.1", "[::1]"].includes(bridge.hostname)
+      || endpoint.pathname !== "/api/mcp/project-tools" || endpoint.search || endpoint.hash
+      || bridge.username || bridge.password || bridge.search || bridge.hash
+    ) {
+      throw new Error("Cannot route Paperclip project tools through the run bridge.");
+    }
+    return {
+      ...server,
+      url: new URL("/api/mcp/project-tools", bridge).toString(),
+      token: input.bridgeToken,
+    };
+  });
+}
+
 function managedMcpEntries(
   existing: Record<string, unknown>,
   servers: AdapterRuntimeMcpServer[],
