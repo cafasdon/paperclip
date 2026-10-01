@@ -1027,6 +1027,28 @@ POST /api/tool-connections/:connectionId/test-calls
 DELETE /api/tool-connections/:connectionId
 ```
 
+For a slow remote MCP `tools/call`, set `config.remoteMcpToolTimeoutMs` on that
+connection (for example `60000` for 60 seconds). The value is an integer in
+milliseconds, clamped to 1–60 seconds. Without it, calls retain the 10-second
+default. It applies to managed agent MCP calls and the connector Test action;
+an explicit gateway `timeoutMs` still takes precedence, and server-executed
+approved agent actions retain their 60-second execution window. A connection
+update replaces its `config` object, so include the existing endpoint and
+other settings when patching it. The timeout aborts Paperclip's wait; it does
+not prove that an upstream write was cancelled. Reconcile the remote state
+before retrying a write after a timeout.
+OpenCode-managed connections use a 75-second client deadline so its tool call
+can receive the result of Paperclip's maximum 60-second gateway wait.
+Its managed MCP endpoints are reasserted through a final file-backed per-run
+config layer, so a home OpenCode config cannot redirect a managed bearer.
+For permissions-enforced SSH runs, this layer preserves the remote user's
+OpenCode provider and permission config while reading managed endpoints and
+bearers from private per-run files.
+Before each managed run, Paperclip checks the effective OpenCode config in the
+same execution environment and stops if any managed endpoint or bearer has
+changed. This check is a point-in-time guard; a trusted host or organisation
+administrator can change policy after it runs.
+
 Responses may contain secret IDs, version selectors, header names, prefixes,
 scope names, expiry timestamps, and redacted provider metadata. They must not
 contain secret values. Logs and activity should identify the operation and

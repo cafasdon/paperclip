@@ -269,8 +269,10 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   command?: unknown;
   cwd?: unknown;
   env?: unknown;
+  redact?: (value: string) => string;
 }): Promise<AdapterModel[]> {
   const model = requireOpenCodeModelId(input.model);
+  const redactDiagnostic = (value: string) => input.redact?.(value) ?? value;
 
   // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
   // provider/model at run time (e.g. gateway-routed models that never appear in
@@ -302,7 +304,7 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     // completed work and its terminal disposition, which then reopened the issue.)
     console.warn(
       `[opencode-local] Model availability probe could not run for "${model}" (${
-        err instanceof Error ? err.message : String(err)
+        redactDiagnostic(err instanceof Error ? err.message : String(err))
       }); proceeding with the configured model.`,
     );
     return [{ id: model, label: model }];
@@ -336,7 +338,7 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     } catch (err) {
       console.warn(
         `[opencode-local] Model availability refresh failed for "${model}" (${
-          err instanceof Error ? err.message : String(err)
+          redactDiagnostic(err instanceof Error ? err.message : String(err))
         }); preserving the cached availability rejection.`,
       );
     }
@@ -345,9 +347,9 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
       .slice(0, 12)
       .map((entry) => entry.id)
       .join(", ");
-    throw new Error(
+    throw new Error(redactDiagnostic(
       `Configured OpenCode model is unavailable: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`,
-    );
+    ));
   }
 
   return models;

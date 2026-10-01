@@ -59,11 +59,60 @@ import {
   requireOpenCodeModelId,
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
-import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+import { assertOpenCodeManagedMcpBindings, openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes, routeRemoteProjectToolsMcpThroughBridge, type ManagedOpenCodeMcpServer } from "./runtime-config.js";
+import { createStreamingSecretRedactor } from "./secret-redactor.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function expectedRemoteConfigDir(target: NonNullable<AdapterExecutionContext["executionTarget"]>, runId: string): string {
+  if (target.kind !== "remote" || !/^[A-Za-z0-9_-]+$/.test(runId)) {
+    throw new Error("Cannot stage OpenCode runtime config for this execution target.");
+  }
+  const workspaceDir = target.transport === "ssh"
+    ? path.posix.join(target.spec.remoteCwd, ".paperclip-runtime", "runs", runId, "workspace")
+    : target.remoteCwd;
+  if (!path.posix.isAbsolute(workspaceDir)) {
+    throw new Error("OpenCode remote workspace must be an absolute path.");
+  }
+  return path.posix.join(workspaceDir, ".paperclip-runtime", "opencode", "xdgConfig");
+}
+
+async function runRemoteConfigCommand(input: {
+  runId: string;
+  target: NonNullable<AdapterExecutionContext["executionTarget"]>;
+  configDir: string;
+  action: "harden" | "remove";
+  cwd: string;
+  timeoutSec: number;
+  graceSec: number;
+}): Promise<void> {
+  const configPath = path.posix.join(input.configDir, "opencode", "opencode.json");
+  const configFileDir = path.posix.dirname(configPath);
+  const command = input.action === "harden"
+    ? `chmod 700 ${shellQuote(input.configDir)} ${shellQuote(configFileDir)} && ` +
+      `chmod 600 ${shellQuote(configPath)} && ` +
+      `find ${shellQuote(configFileDir)} -maxdepth 1 -type f -name 'paperclip-managed-mcp-*' -exec chmod 600 -- {} +`
+    // Sandbox asset extraction may fail after its sibling upload archive was
+    // written but before the staging command deleted it. Remove both owned
+    // paths even when the asset stage itself never returned.
+    : `rm -rf -- ${shellQuote(input.configDir)} ${shellQuote(`${input.configDir}-upload.tar`)}`;
+  const result = await runAdapterExecutionTargetShellCommand(input.runId, input.target, command, {
+    cwd: input.cwd,
+    env: {},
+    timeoutSec: input.timeoutSec,
+    graceSec: input.graceSec,
+    onLog: async () => {},
+  });
+  if (result.timedOut || result.exitCode !== 0) {
+    throw new Error(`Failed to ${input.action} staged OpenCode runtime config.`);
+  }
+}
 
 function firstNonEmptyLine(text: string): string {
   return (
@@ -88,6 +137,41 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
 
+async function verifyEffectiveOpenCodeManagedMcp(input: {
+  runId: string;
+  executionTarget: AdapterExecutionContext["executionTarget"];
+  command: string;
+  cwd: string;
+  env: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+  bindings: ManagedOpenCodeMcpServer[];
+}): Promise<void> {
+  const failure = () => new Error("OpenCode effective managed MCP configuration could not be verified.");
+  if (input.bindings.length === 0) throw failure();
+  const maximum = input.executionTarget?.kind === "remote" && input.executionTarget.transport === "sandbox"
+    ? 90 : 30;
+  try {
+    // `debug config` resolves every OpenCode layer, including system-managed
+    // and organisation policy loaded after OPENCODE_CONFIG_CONTENT. Keep its
+    // complete output private: it can contain provider keys and MCP bearers.
+    const probe = await runAdapterExecutionTargetProcess(
+      input.runId, input.executionTarget, input.command, ["debug", "config"], {
+        cwd: input.cwd,
+        env: input.env,
+        timeoutSec: input.timeoutSec > 0 ? Math.min(input.timeoutSec, maximum) : maximum,
+        graceSec: Math.min(input.graceSec, 5),
+        onLog: async () => {},
+      },
+    );
+    if (probe.timedOut || probe.exitCode !== 0) throw failure();
+    assertOpenCodeManagedMcpBindings(probe.stdout, input.bindings);
+  } catch {
+    // Tool/transport failures and parser diagnostics may contain secrets.
+    throw failure();
+  }
+}
+
 export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   runId: string;
   executionTarget: NonNullable<AdapterExecutionContext["executionTarget"]>;
@@ -97,6 +181,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   env: Record<string, string>;
   timeoutSec: number;
   graceSec: number;
+  redact?: (value: string) => string;
 }) {
   const model = requireOpenCodeModelId(input.model);
 
@@ -144,7 +229,8 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   }
 
   if ((probe.exitCode ?? 1) !== 0) {
-    const detail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
+    const rawDetail = firstNonEmptyLine(probe.stderr) || firstNonEmptyLine(probe.stdout);
+    const detail = input.redact ? input.redact(rawDetail) : rawDetail;
     console.warn(
       `[opencode-local] Remote \`opencode models\` could not run for "${model}"${
         detail ? ` (${detail})` : ""
@@ -163,9 +249,8 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
 
   if (!models.some((entry) => entry.id === model)) {
     const sample = models.slice(0, 12).map((entry) => entry.id).join(", ");
-    throw new Error(
-      `Configured OpenCode model is unavailable on the remote execution target: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`,
-    );
+    const message = `Configured OpenCode model is unavailable on the remote execution target: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`;
+    throw new Error(input.redact ? input.redact(message) : message);
   }
 }
 
@@ -223,7 +308,14 @@ async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
-  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const { runId, agent, runtime, config, context, onMeta, onSpawn, authToken } = ctx;
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  const runtimeMcpIdentity = openCodeMcpServerIdentity(runtimeMcpServers);
+  const logRedactor = createStreamingSecretRedactor(
+    runtimeMcpServers.map(({ token }) => token), ctx.onLog,
+  );
+  const redact = logRedactor.redact;
+  const onLog: AdapterExecutionContext["onLog"] = logRedactor.write;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -324,28 +416,40 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // selection is already handled via the --model CLI flag.  Set after the
   // envConfig loop so user overrides cannot disable this guard.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  if (authToken) {
+  if (executionTargetIsRemote) {
+    delete env.PAPERCLIP_API_KEY;
+  } else if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env, config, runtimeMcpServers: executionTargetIsRemote ? [] : runtimeMcpServers,
+  });
+  const runtimeConfigCleanups = [preparedRuntimeConfig.cleanup];
+  let managedMcpBindings = preparedRuntimeConfig.managedMcpBindings ?? [];
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+  let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
+  let localSkillsDir: string | null = null;
+  let remoteConfigDir: string | null = null;
+  let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  let timeoutSec = 0;
+  let graceSec = 20;
   try {
     const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
+    timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
       executionTarget,
       asNumber(config.timeoutSec, 0),
     );
-    const graceSec = asNumber(config.graceSec, 20);
+    graceSec = asNumber(config.graceSec, 20);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,
       installCommand: ctx.runtimeCommandSpec?.installCommand,
-    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
+      detectCommand: ctx.runtimeCommandSpec?.detectCommand,
       cwd,
       env: runtimeEnv,
       timeoutSec,
@@ -368,6 +472,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         command,
         cwd,
         env: runtimeEnv,
+        redact,
       });
     }
 
@@ -376,10 +481,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (fromExtraArgs.length > 0) return fromExtraArgs;
       return asStringArray(config.args);
     })();
-    let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
-    let localSkillsDir: string | null = null;
     let remoteRuntimeRootDir: string | null = null;
-    let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
     if (executionTarget?.kind === "remote") {
       localSkillsDir = await buildOpenCodeSkillsDir(config);
@@ -387,6 +489,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[paperclip] Syncing workspace and OpenCode runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
       );
+      if (localRuntimeConfigHome) {
+        // This path is known before staging, so a partial upload can be removed.
+        remoteConfigDir = expectedRemoteConfigDir(executionTarget, runId);
+      }
       const preparedExecutionTargetRuntime = await prepareAdapterExecutionTargetRuntime({
         runId,
         target: executionTarget,
@@ -413,6 +519,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       restoreRemoteWorkspace = () =>
         preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));
+      if (localRuntimeConfigHome) {
+        const stagedConfigDir = preparedExecutionTargetRuntime.assetDirs.xdgConfig;
+        if (!stagedConfigDir || stagedConfigDir !== remoteConfigDir) {
+          throw new Error("OpenCode runtime config was not staged at the expected remote path.");
+        }
+        await runRemoteConfigCommand({
+          runId, target: executionTarget, configDir: stagedConfigDir,
+          action: "harden", cwd, timeoutSec, graceSec,
+        });
+      }
       effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir ?? effectiveExecutionCwd;
       refreshPaperclipWorkspaceEnvForExecution({
         env: preparedRuntimeConfig.env,
@@ -462,16 +578,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
         );
       }
-      await ensureRemoteOpenCodeModelConfiguredAndAvailable({
-        runId,
-        executionTarget,
-        command,
-        model,
-        cwd,
-        env: preparedRuntimeConfig.env,
-        timeoutSec,
-        graceSec,
-      });
+      if (runtimeMcpServers.length === 0) {
+        await ensureRemoteOpenCodeModelConfiguredAndAvailable({
+          runId, executionTarget, command, model, cwd,
+          env: preparedRuntimeConfig.env, timeoutSec, graceSec, redact,
+        });
+      }
     }
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
@@ -483,10 +595,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runtimeRootDir: remoteRuntimeRootDir,
         adapterKey: "opencode",
         timeoutSec,
-        hostApiToken: preparedRuntimeConfig.env.PAPERCLIP_API_KEY,
+        hostApiToken: authToken,
         onLog,
       });
       if (paperclipBridge) {
+        logRedactor.addSecret(paperclipBridge.env.PAPERCLIP_API_KEY);
         Object.assign(preparedRuntimeConfig.env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
           runtimeEnv: Object.fromEntries(
@@ -500,15 +613,87 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
+    if (executionTargetIsRemote && runtimeMcpServers.length > 0) {
+      if (executionTarget?.kind !== "remote" || !paperclipBridge) {
+        throw new Error("Paperclip-managed OpenCode MCP requires a live remote bridge.");
+      }
+      const bridgedServers = routeRemoteProjectToolsMcpThroughBridge({
+        servers: runtimeMcpServers,
+        hostApiToken: authToken,
+        bridgeApiUrl: paperclipBridge.env.PAPERCLIP_API_URL,
+        bridgeToken: paperclipBridge.env.PAPERCLIP_API_KEY,
+      });
+      const bearerConfig = await prepareOpenCodeRuntimeConfig({
+        env, config, runtimeMcpServers: bridgedServers,
+      });
+      managedMcpBindings = bearerConfig.managedMcpBindings ?? [];
+      runtimeConfigCleanups.push(bearerConfig.cleanup);
+      const localBearerConfigHome = bearerConfig.env.XDG_CONFIG_HOME;
+      if (!localBearerConfigHome) throw new Error("OpenCode runtime MCP config was not prepared.");
+      remoteConfigDir ??= expectedRemoteConfigDir(executionTarget, runId);
+      const staged = await prepareAdapterExecutionTargetRuntime({
+        runId,
+        target: executionTarget,
+        adapterKey: "opencode",
+        workspaceLocalDir: cwd,
+        workspaceRemoteDir: effectiveExecutionCwd,
+        syncWorkspace: false,
+        timeoutSec,
+        assets: [{ key: "xdgConfig", localDir: localBearerConfigHome }],
+      });
+      if (staged.assetDirs.xdgConfig !== remoteConfigDir) {
+        throw new Error("OpenCode runtime MCP config was not staged at the expected remote path.");
+      }
+      await runRemoteConfigCommand({
+        runId, target: executionTarget, configDir: remoteConfigDir,
+        action: "harden", cwd, timeoutSec, graceSec,
+      });
+      // A permissions-enforced SSH run may rely on provider and permission
+      // settings in the remote user's own XDG config. The final MCP overlay
+      // reads its sidecars by absolute path, so it does not need to replace
+      // that config. Keep the staged XDG home only when this run already used
+      // it for Paperclip's runtime config or managed provider authentication.
+      if (localRuntimeConfigHome || config.managedAiConnection) {
+        preparedRuntimeConfig.env.XDG_CONFIG_HOME = remoteConfigDir;
+      }
+      if (!bearerConfig.managedMcpOverlayContentForHome) {
+        throw new Error("OpenCode managed MCP overlay was not prepared.");
+      }
+      preparedRuntimeConfig.env.OPENCODE_CONFIG_CONTENT =
+        bearerConfig.managedMcpOverlayContentForHome(remoteConfigDir);
+      preparedRuntimeConfig.notes.push(`Injected ${runtimeMcpServers.length} Paperclip-managed OpenCode MCP server(s).`);
+    }
+    if (executionTarget?.kind === "remote" && runtimeMcpServers.length > 0) {
+      await ensureRemoteOpenCodeModelConfiguredAndAvailable({
+        runId,
+        executionTarget,
+        command,
+        model,
+        cwd,
+        env: preparedRuntimeConfig.env,
+        timeoutSec,
+        graceSec,
+        redact,
+      });
+    }
+
     const runtimeSessionParams = parseObject(runtime.sessionParams);
     const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
     const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
     const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
+    const savedMcpIdentity = asString(runtimeSessionParams.mcpServerIdentity, "");
+    const hasMatchingMcpServers = savedMcpIdentity
+      ? savedMcpIdentity === runtimeMcpIdentity
+      : runtimeMcpServers.length === 0;
     const canResumeSession =
       runtimeSessionId.length > 0 &&
+      hasMatchingMcpServers &&
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
       adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
     const sessionId = canResumeSession ? runtimeSessionId : null;
+    if (runtimeSessionId && !hasMatchingMcpServers) {
+      await onLog("stdout", `[paperclip] OpenCode session "${runtimeSessionId}" has a different runtime MCP server set and will not be resumed.\n`);
+    }
     if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
       await onLog(
         "stdout",
@@ -623,6 +808,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     const runAttempt = async (resumeSessionId: string | null) => {
+      if (runtimeMcpServers.length > 0) {
+        await verifyEffectiveOpenCodeManagedMcp({
+          runId, executionTarget: runtimeExecutionTarget, command, cwd,
+          env: preparedRuntimeConfig.env, timeoutSec, graceSec,
+          bindings: managedMcpBindings,
+        });
+      }
       const { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
       const prompt = joinPromptSections([
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
@@ -643,19 +835,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
-      const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-        onProcessStopped: providerStop.beginInvocation(),
-        cwd,
-        env: preparedRuntimeConfig.env,
-        stdin: prompt,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog,
-        runLogTail: paperclipBridge?.runLogTail,
-        settleRunDisposition: paperclipBridge?.settleRunDisposition,
-      });
+      let rawProc: Awaited<ReturnType<typeof runAdapterExecutionTargetProcess>>;
+      try {
+        rawProc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+          onProcessStopped: providerStop.beginInvocation(),
+          cwd,
+          env: preparedRuntimeConfig.env,
+          stdin: prompt,
+          timeoutSec,
+          graceSec,
+          onSpawn,
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog,
+          runLogTail: paperclipBridge?.runLogTail,
+          settleRunDisposition: paperclipBridge?.settleRunDisposition,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (redact(message) !== message) throw new Error(redact(message));
+        throw error;
+      }
+      const proc = { ...rawProc, stdout: redact(rawProc.stdout), stderr: redact(rawProc.stderr) };
       return {
         proc,
         rawStderr: proc.stderr,
@@ -683,11 +883,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       const resolvedSessionId =
         attempt.parsed.sessionId ??
-        (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
+        (clearSessionOnMissingSession ? null : sessionId);
       const resolvedSessionParams = resolvedSessionId
         ? ({
             sessionId: resolvedSessionId,
             cwd: effectiveExecutionCwd,
+            mcpServerIdentity: runtimeMcpIdentity,
             ...(workspaceId ? { workspaceId } : {}),
             ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
             ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
@@ -736,7 +937,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: attempt.proc.stderr,
         },
         summary: attempt.parsed.summary,
-        clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
+        clearSession: Boolean((clearSessionOnMissingSession || !canResumeSession) && !attempt.parsed.sessionId && runtimeSessionId),
       };
     };
 
@@ -759,17 +960,45 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       return toResult(initial);
     } finally {
+      await providerStop.collectBeforeRestore();
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (redact(message) !== message) throw new Error(redact(message));
+    throw error;
+  } finally {
+    let cleanupError: Error | null = null;
+    try {
+      await paperclipBridge?.stop();
+    } catch {
+      cleanupError = new Error("Failed to stop the OpenCode run bridge.");
+    }
+    if (remoteConfigDir && executionTarget?.kind === "remote") {
       try {
-        await providerStop.collectBeforeRestore();
-      } finally {
-        await Promise.all([
-          paperclipBridge?.stop(),
-          restoreRemoteWorkspace?.(),
-          localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-        ]);
+        await runRemoteConfigCommand({
+          runId, target: executionTarget, configDir: remoteConfigDir,
+          action: "remove", cwd, timeoutSec, graceSec,
+        });
+      } catch {
+        cleanupError ??= new Error("Failed to remove staged OpenCode runtime config.");
       }
     }
-  } finally {
-    await preparedRuntimeConfig.cleanup();
+    for (const cleanup of [
+      () => restoreRemoteWorkspace?.(),
+      () => localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }) : undefined,
+      ...runtimeConfigCleanups.map((cleanup) => () => cleanup()),
+    ]) {
+      try {
+        await cleanup();
+      } catch {
+        cleanupError ??= new Error("Failed to clean up OpenCode runtime assets.");
+      }
+    }
+    try {
+      await logRedactor.flush();
+    } catch {
+      cleanupError ??= new Error("Failed to flush redacted OpenCode logs.");
+    }
+    if (cleanupError) throw cleanupError;
   }
 }

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import { assertOpenCodeManagedMcpBindings, openCodeMcpServerIdentity, prepareOpenCodeRuntimeConfig, routeRemoteProjectToolsMcpThroughBridge } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -31,6 +31,222 @@ async function makeConfigHome(initialConfig?: Record<string, unknown>) {
 }
 
 describe("prepareOpenCodeRuntimeConfig", () => {
+  const managedServers = [
+    { name: "research", url: "https://mcp.example.test/mcp", token: "test-bearer-secret", connectionId: "connection-1" },
+    { name: "research", url: "https://mcp2.example.test/mcp", token: "other-test-secret", connectionId: "connection-2" },
+  ];
+
+  it("verifies every effective managed URL and bearer without echoing a secret on failure", () => {
+    const expected = [
+      { name: "research", url: "https://mcp.example.test/mcp", token: "test-bearer-secret" },
+      { name: "ops", url: "https://ops.example.test/mcp", token: "other-test-secret" },
+    ];
+    const good = { mcp: {
+      research: { type: "remote", url: expected[0]!.url, enabled: true, oauth: false,
+        headers: { Authorization: `Bearer ${expected[0]!.token}` } },
+      ops: { type: "remote", url: expected[1]!.url, enabled: true, oauth: false,
+        headers: { Authorization: `Bearer ${expected[1]!.token}` } },
+    } };
+    expect(() => assertOpenCodeManagedMcpBindings(JSON.stringify(good), expected)).not.toThrow();
+    for (const bad of [
+      "not-json",
+      JSON.stringify({ mcp: { research: good.mcp.research } }),
+      JSON.stringify({ mcp: { ...good.mcp, ops: { ...good.mcp.ops, url: "https://redirect.example.test/mcp" } } }),
+      JSON.stringify({ mcp: { ...good.mcp, research: { ...good.mcp.research,
+        headers: { Authorization: `Bearer ${expected[0]!.token}`, authorization: "Bearer other" } } } }),
+    ]) {
+      expect(() => assertOpenCodeManagedMcpBindings(bad, expected))
+        .toThrow("OpenCode effective managed MCP configuration could not be verified.");
+      try { assertOpenCodeManagedMcpBindings(bad, expected); }
+      catch (error) { expect(String(error)).not.toContain("test-bearer-secret"); }
+    }
+  });
+
+  it("preserves user config and writes managed remote MCP servers in a private per-run config", async () => {
+    const source = { theme: "system", permission: { read: "ask" }, mcp: { research: { type: "local", command: ["fixture"] } } };
+    const configHome = await makeConfigHome(source);
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { dangerouslySkipPermissions: false },
+      runtimeMcpServers: managedServers,
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeConfigPath = path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json");
+    const runtimeConfig = JSON.parse(await fs.readFile(runtimeConfigPath, "utf8"));
+    expect(runtimeConfig).toMatchObject({
+      theme: "system",
+      permission: { read: "ask" },
+      mcp: {
+        research: source.mcp.research,
+        "research-connecti": {
+          type: "remote", url: managedServers[0]!.url, enabled: true, oauth: false,
+          headers: { Authorization: "Bearer test-bearer-secret" }, timeout: 75_000,
+        },
+        "research-connecti-2": {
+          type: "remote", url: managedServers[1]!.url, enabled: true, oauth: false,
+          headers: { Authorization: "Bearer other-test-secret" }, timeout: 75_000,
+        },
+      },
+    });
+    expect(await fs.readFile(path.join(configHome, "opencode", "opencode.json"), "utf8"))
+      .toBe(`${JSON.stringify(source, null, 2)}\n`);
+    expect(JSON.stringify(prepared.notes)).not.toContain("test-bearer-secret");
+    const overlay = JSON.parse(prepared.env.OPENCODE_CONFIG_CONTENT!);
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain("test-bearer-secret");
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain(managedServers[0]!.url);
+    const managedOverlay = overlay.mcp["research-connecti"];
+    expect(managedOverlay.timeout).toBe(75_000);
+    expect(await fs.readFile(managedOverlay.url.slice(6, -1), "utf8")).toBe(managedServers[0]!.url);
+    expect(await fs.readFile(managedOverlay.headers.Authorization.slice(6, -1), "utf8"))
+      .toBe("Bearer test-bearer-secret");
+    if (process.platform !== "win32") {
+      expect((await fs.stat(runtimeConfigPath)).mode & 0o777).toBe(0o600);
+    }
+    await prepared.cleanup();
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+    await expect(fs.access(runtimeConfigPath)).rejects.toThrow();
+  });
+
+  it("keeps the source config unchanged when it is a symlink", async () => {
+    const configHome = await makeConfigHome();
+    const sourcePath = path.join(configHome, "linked.json");
+    const configPath = path.join(configHome, "opencode", "opencode.json");
+    await fs.writeFile(sourcePath, JSON.stringify({ theme: "linked" }));
+    await fs.symlink(sourcePath, configPath);
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome }, config: {}, runtimeMcpServers: managedServers,
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    expect(JSON.parse(await fs.readFile(sourcePath, "utf8"))).toEqual({ theme: "linked" });
+    expect((await fs.lstat(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"))).isSymbolicLink()).toBe(false);
+    await prepared.cleanup();
+  });
+
+  it("collapses later JSONC config before allocating managed names so a bearer cannot follow an overridden URL", async () => {
+    const configHome = await makeConfigHome();
+    const configDir = path.join(configHome, "opencode");
+    const commentedJson = '{\n // OpenCode accepts comments in .json too\n "theme": "system",\n}\n';
+    const laterJsonc = '{\n "mcp": { "research": { "type": "remote", "url": "https://untrusted.example.test/mcp" } },\n}\n';
+    await fs.writeFile(path.join(configDir, "config.json"), '{ "permission": { "read": "ask" } }');
+    await fs.writeFile(path.join(configDir, "opencode.json"), commentedJson);
+    await fs.writeFile(path.join(configDir, "opencode.jsonc"), laterJsonc);
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome }, config: { dangerouslySkipPermissions: false },
+      runtimeMcpServers: [managedServers[0]!],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeDir = path.join(prepared.env.XDG_CONFIG_HOME, "opencode");
+    const effective = JSON.parse(await fs.readFile(path.join(runtimeDir, "opencode.json"), "utf8"));
+    expect(effective).toMatchObject({
+      theme: "system",
+      permission: { read: "ask" },
+      mcp: {
+        research: { url: "https://untrusted.example.test/mcp" },
+        "research-connecti": {
+          url: managedServers[0]!.url,
+          headers: { Authorization: `Bearer ${managedServers[0]!.token}` },
+          timeout: 75_000,
+        },
+      },
+    });
+    expect(effective.mcp.research.headers).toBeUndefined();
+    await expect(fs.access(path.join(runtimeDir, "opencode.jsonc"))).rejects.toThrow();
+    await expect(fs.access(path.join(runtimeDir, "config.json"))).rejects.toThrow();
+    expect(await fs.readFile(path.join(configDir, "opencode.json"), "utf8")).toBe(commentedJson);
+    expect(await fs.readFile(path.join(configDir, "opencode.jsonc"), "utf8")).toBe(laterJsonc);
+    expect(prepared.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe("true");
+    await prepared.cleanup();
+  });
+
+  it("reasserts the managed endpoint after a conflicting home OpenCode config without putting secrets in env", async () => {
+    const configHome = await makeConfigHome();
+    const home = path.join(configHome, "home");
+    await fs.mkdir(path.join(home, ".opencode"), { recursive: true });
+    const conflictingHome = '{"mcp":{"research":{"type":"remote","url":"https://untrusted.example.test/mcp"}}}';
+    await fs.writeFile(path.join(home, ".opencode", "opencode.json"), conflictingHome);
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, HOME: home },
+      config: { dangerouslySkipPermissions: false },
+      runtimeMcpServers: [managedServers[0]!],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const overlay = JSON.parse(prepared.env.OPENCODE_CONFIG_CONTENT!);
+    const managedOverlay = overlay.mcp.research;
+    expect(managedOverlay.type).toBe("remote");
+    expect(await fs.readFile(managedOverlay.url.slice(6, -1), "utf8")).toBe(managedServers[0]!.url);
+    expect(await fs.readFile(managedOverlay.headers.Authorization.slice(6, -1), "utf8"))
+      .toBe(`Bearer ${managedServers[0]!.token}`);
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain(managedServers[0]!.url);
+    expect(prepared.env.OPENCODE_CONFIG_CONTENT).not.toContain(managedServers[0]!.token);
+    expect(await fs.readFile(path.join(home, ".opencode", "opencode.json"), "utf8"))
+      .toBe(conflictingHome);
+    expect(prepared.managedMcpOverlayContentForHome?.("/remote/xdgConfig"))
+      .toContain("{file:/remote/xdgConfig/opencode/paperclip-managed-mcp-");
+    expect(() => prepared.managedMcpOverlayContentForHome?.("/remote/bad}path"))
+      .toThrow("cannot be used in a file reference");
+    await prepared.cleanup();
+  });
+
+  it("rejects later OpenCode config overrides while managed bearer credentials are present", async () => {
+    const configHome = await makeConfigHome();
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, OPENCODE_CONFIG_CONTENT: '{"mcp":{"research":{"url":"https://untrusted.example.test/mcp"}}}' },
+      config: { dangerouslySkipPermissions: false }, runtimeMcpServers: [managedServers[0]!],
+    })).rejects.toThrow("cannot use OPENCODE_CONFIG_CONTENT");
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, OPENCODE_TEST_MANAGED_CONFIG_DIR: "/tmp/untrusted" },
+      config: { dangerouslySkipPermissions: false }, runtimeMcpServers: [managedServers[0]!],
+    })).rejects.toThrow("cannot use OPENCODE_TEST_MANAGED_CONFIG_DIR");
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, opencode_test_managed_config_dir: "/tmp/untrusted" },
+      config: { dangerouslySkipPermissions: false }, runtimeMcpServers: [managedServers[0]!],
+    })).rejects.toThrow("cannot use OPENCODE_TEST_MANAGED_CONFIG_DIR");
+  });
+
+  it("fails closed on malformed config or MCP server and leaves no runtime config", async () => {
+    const configHome = await makeConfigHome();
+    await fs.writeFile(path.join(configHome, "opencode", "opencode.json"), "invalid json");
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome }, config: {}, runtimeMcpServers: managedServers,
+    })).rejects.toThrow("Existing OpenCode config");
+    await fs.writeFile(path.join(configHome, "opencode", "opencode.json"), "{}");
+    await expect(prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome }, config: {},
+      runtimeMcpServers: [{ ...managedServers[0]!, token: "" }],
+    })).rejects.toThrow("incomplete");
+  });
+
+  it("uses a token-free, order-stable MCP session identity", () => {
+    const identity = openCodeMcpServerIdentity(managedServers);
+    expect(openCodeMcpServerIdentity([...managedServers].reverse())).toBe(identity);
+    expect(openCodeMcpServerIdentity([{ ...managedServers[0]!, token: "rotated" }, managedServers[1]!])).toBe(identity);
+    expect(openCodeMcpServerIdentity([managedServers[0]!])).not.toBe(identity);
+    expect(identity).not.toContain("test-bearer-secret");
+  });
+
+  it("routes the long-lived project JWT through the run bridge and fails closed on a mismatch", () => {
+    const project = {
+      name: "Paperclip projects", url: "https://paperclip.example.test/api/mcp/project-tools",
+      token: "host-only-jwt", connectionId: "paperclip-project-tools",
+    };
+    const options = {
+      servers: [project, managedServers[0]!], hostApiToken: "host-only-jwt",
+      bridgeApiUrl: "http://127.0.0.1:4310", bridgeToken: "run-bridge-token",
+    };
+    expect(routeRemoteProjectToolsMcpThroughBridge(options)).toEqual([
+      { ...project, url: "http://127.0.0.1:4310/api/mcp/project-tools", token: "run-bridge-token" },
+      managedServers[0],
+    ]);
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, bridgeToken: "" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, bridgeToken: "host-only-jwt" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, bridgeApiUrl: "https://other.example.test" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({ ...options, hostApiToken: "wrong" })).toThrow("run bridge");
+    expect(() => routeRemoteProjectToolsMcpThroughBridge({
+      ...options, servers: [{ ...project, url: "https://paperclip.example.test/api/other" }],
+    })).toThrow("run bridge");
+  });
+
   it("allows all tools and connected tools by default", async () => {
     const configHome = await makeConfigHome({
       permission: {

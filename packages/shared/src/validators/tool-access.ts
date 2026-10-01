@@ -146,7 +146,18 @@ export const mcpConnectionCredentialRefSchema = z.object({
   prefix: z.string().max(120).nullable().optional(),
 });
 
-export const toolTransportConfigSchema = z.record(z.string(), z.unknown()).superRefine(rejectSensitiveConfigKeys);
+export const toolTransportConfigSchema = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
+  rejectSensitiveConfigKeys(value, ctx);
+  const remoteTimeout = value.remoteMcpToolTimeoutMs;
+  if (remoteTimeout !== undefined &&
+      (typeof remoteTimeout !== "number" || !Number.isFinite(remoteTimeout) || !Number.isInteger(remoteTimeout))) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["remoteMcpToolTimeoutMs"],
+      message: "Remote MCP tool timeout must be a finite integer in milliseconds",
+    });
+  }
+});
 
 export const toolRedactedValueSummarySchema = z.object({
   summary: z.string().max(4000),

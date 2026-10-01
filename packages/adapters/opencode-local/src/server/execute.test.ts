@@ -47,6 +47,124 @@ describe("OpenCode local skill injection", () => {
     await fs.rm(configHome, { recursive: true, force: true });
   });
 
+  it("passes managed MCP through a temporary config without exposing the bearer in args, logs, or metadata", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-mcp");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const server = { name: "research", url: "https://mcp.example.test/mcp", token: "local-test-bearer", connectionId: "connection-1" };
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+    let stagedHome = "";
+    runProcessMock.mockReset();
+    runProcessMock.mockImplementationOnce(async (_runId, _target, _command, args, options) => {
+      expect(args).toEqual(["debug", "config"]);
+      stagedHome = options.env.XDG_CONFIG_HOME;
+      const config = JSON.parse(await fs.readFile(path.join(stagedHome, "opencode", "opencode.json"), "utf8"));
+      expect(config.mcp.research).toMatchObject({
+        type: "remote", url: server.url, enabled: true, oauth: false,
+        headers: { Authorization: "Bearer local-test-bearer" },
+      });
+      return probeResult({ stdout: JSON.stringify(config) });
+    });
+    runProcessMock.mockImplementationOnce(async (_runId, _target, _command, _args, options) => {
+      await options.onLog?.("stderr", "runtime echoed local-test-");
+      await options.onLog?.("stderr", "bearer");
+      return probeResult({ stdout: [
+        JSON.stringify({ type: "step_start", sessionID: "mcp-session" }),
+        JSON.stringify({ type: "text", sessionID: "mcp-session", part: { text: "local-test-bearer" } }),
+      ].join("\n") });
+    });
+    const first = await execute({
+      runId: "run-mcp-local",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", dangerouslySkipPermissions: false,
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1", XDG_CONFIG_HOME: configHome } },
+      context: {}, runtimeMcp: { getServers: () => [server] },
+      onLog: async (_stream, chunk) => { logs.push(chunk); },
+      onMeta: async (meta) => { metadata.push(meta); },
+    });
+    expect(first.exitCode).toBe(0);
+    expect(first.sessionParams?.mcpServerIdentity).toMatch(/^sha256:/);
+    expect(JSON.stringify({ args: runProcessMock.mock.calls.map((call) => call[3]), logs, metadata, first })).not.toContain(server.token);
+    await expect(fs.access(stagedHome)).rejects.toThrow();
+
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValueOnce(probeResult({ stdout: "" }));
+    const changed = await execute({
+      runId: "run-mcp-local-changed",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: first.sessionId ?? null, sessionParams: first.sessionParams ?? null, sessionDisplayId: first.sessionId ?? null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", dangerouslySkipPermissions: false,
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1", XDG_CONFIG_HOME: configHome } },
+      context: {}, runtimeMcp: { getServers: () => [] },
+      onLog: async () => {},
+    });
+    expect(runProcessMock.mock.calls[0]?.[3]).not.toContain("--session");
+    expect(changed.sessionId).toBeNull();
+    expect(changed.clearSession).toBe(true);
+  });
+
+  it("removes the bearer config when the local OpenCode process throws", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-mcp-failure");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    let stagedHome = "";
+    runProcessMock.mockReset();
+    runProcessMock.mockImplementationOnce(async (_runId, _target, _command, _args, options) => {
+      stagedHome = options.env.XDG_CONFIG_HOME;
+      const config = await fs.readFile(path.join(stagedHome, "opencode", "opencode.json"), "utf8");
+      return probeResult({ stdout: config });
+    });
+    runProcessMock.mockImplementationOnce(async () => {
+      throw new Error("synthetic OpenCode failure exposed failure-bearer");
+    });
+    await expect(execute({
+      runId: "run-mcp-fail",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5",
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1", XDG_CONFIG_HOME: configHome } },
+      context: {}, runtimeMcp: { getServers: () => [{ name: "research", url: "https://mcp.example.test/mcp", token: "failure-bearer", connectionId: "connection-1" }] },
+      onLog: async () => {},
+    })).rejects.toThrow("synthetic OpenCode failure exposed ***REDACTED***");
+    await expect(fs.access(stagedHome)).rejects.toThrow();
+  });
+
+  it.each(["missing", "malformed", "redirected", "probe_error"])(
+    "blocks a managed MCP run when its private effective-config probe is %s",
+    async (failure) => {
+      const commandPath = path.join(configHome, "fake-opencode-preflight");
+      await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const token = "preflight-private-bearer";
+      const logs: string[] = [];
+      const metadata: unknown[] = [];
+      let stagedHome = "";
+      runProcessMock.mockReset();
+      runProcessMock.mockImplementationOnce(async (_runId, _target, _command, args, options) => {
+        expect(args).toEqual(["debug", "config"]);
+        stagedHome = options.env.XDG_CONFIG_HOME;
+        await options.onLog?.("stderr", `provider diagnostic ${token}`);
+        if (failure === "probe_error") throw new Error(`provider diagnostic ${token}`);
+        const base = JSON.parse(await fs.readFile(path.join(stagedHome, "opencode", "opencode.json"), "utf8"));
+        if (failure === "missing") delete base.mcp.research;
+        if (failure === "redirected") base.mcp.research.url = "https://redirect.example.test/mcp";
+        return probeResult({ stdout: failure === "malformed" ? `not JSON ${token}` : JSON.stringify(base), stderr: token });
+      });
+      await expect(execute({
+        runId: `run-preflight-${failure}`,
+        agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", dangerouslySkipPermissions: false,
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1", XDG_CONFIG_HOME: configHome } },
+        context: {}, runtimeMcp: { getServers: () => [{ name: "research", url: "https://mcp.example.test/mcp", token, connectionId: "connection-1" }] },
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        onMeta: async (meta) => { metadata.push(meta); },
+      })).rejects.toThrow("OpenCode effective managed MCP configuration could not be verified.");
+      expect(runProcessMock).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify({ logs, metadata, args: runProcessMock.mock.calls[0]?.[3] })).not.toContain(token);
+      await expect(fs.access(stagedHome)).rejects.toThrow();
+    },
+  );
+
   it.each([false, true])("keeps chat policy with a legacy OpenCode prompt (custom=%s)", async (custom) => {
     const commandPath = path.join(configHome, "fake-opencode");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
