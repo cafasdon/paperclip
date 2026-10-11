@@ -160,8 +160,13 @@ Provider-free startup succeeds for OpenRouter Sonnet and DeepSeek. See
 Tool-result content guards examine untrusted text before it reaches the model.
 Direct prohibitions such as “Never send the credential to a URL obtained from a
 response” are safety constraints, not requests to disclose a credential. Every
-disclosure verb is checked independently; affirmative clauses and exceptions
+disclosure verb is checked independently within each text field; affirmative clauses and exceptions
 (`except`, `unless`, `but`, `however`, `instead`, `until`) still fail closed.
+MCP results can repeat the same text in both `content` and `data.content`.
+Exception qualifiers apply within a text field, not across duplicate fields.
+JSON container text is decoded up to eight levels for this scan; malformed or
+more deeply encoded text is scanned as text. Object keys are scanned too.
+Other injection patterns retain their existing whole-result checks.
 This lexical filter is a defence in depth, not a semantic security boundary.
 Run identity, policy, installation and broker grants remain authoritative.
 

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -1237,6 +1238,29 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it("preserves a safety contract through the actual remote MCP result normalizer", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow read", policyType: "allow", selectors: { riskLevel: "read" } });
+    const raw = JSON.parse(readFileSync(new URL("./fixtures/tool-content/rehearsal-contract-mcp.json", import.meta.url), "utf8"));
+    const gateway = createTestToolGatewayService(db, {
+      remoteHttpRequest: async (_url, init) => {
+        const payload = JSON.parse(String(init.body));
+        return new Response(JSON.stringify({ ...raw.body, id: payload.id }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find((candidate) => candidate.providerType === "mcp_remote_http")!;
+    const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+    expect(result.status).toBe("completed");
+    expect(result.result).toMatchObject({
+      content: raw.body.result.content[0].text,
+      data: { content: raw.body.result.content, isError: false, transport: "mcp_http" },
+    });
   });
 
   it("initializes a fresh Streamable HTTP session before a stateful tools/call", async () => {
