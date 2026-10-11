@@ -1,5 +1,11 @@
 # @paperclipai/adapter-codex-local
 
+## Unreleased
+
+### Patch Changes
+
+- Write managed MCP bearer credentials with Codex's supported `http_headers` setting. Existing managed blocks are replaced on the next run; unmanaged entries remain unchanged.
+
 ## 0.3.1
 
 ### Patch Changes
