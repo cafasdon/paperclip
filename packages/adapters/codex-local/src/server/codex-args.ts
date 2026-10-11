@@ -84,6 +84,9 @@ export function buildCodexExecArgs(
     args.push("-c", 'service_tier="fast"', "-c", "features.fast_mode=true");
   }
   if (extraArgs.length > 0) args.push(...extraArgs);
+  // An explicit false disables even Codex's cached search default. Keep this
+  // trusted adapter override out of operator extraArgs and their auth guard.
+  if (record.search === false) args.push("-c", 'web_search="disabled"');
   if (!bypass && options.networkAccess === false) {
     args.push("-c", "sandbox_workspace_write.network_access=false");
   }
