@@ -4,6 +4,7 @@
 
 ### Patch Changes
 
+- Mark the project and repository listing MCP tools read-only. Mutation tools retain their approval behaviour and authenticated API checks remain unchanged.
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
 ## 0.3.1
