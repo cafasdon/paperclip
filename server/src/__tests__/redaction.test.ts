@@ -699,3 +699,32 @@ second-line\" status=401`,
     });
   });
 });
+
+describe("scheme-only source literals", () => {
+  it("preserves a Python header expression and following source lines", () => {
+    const source = `response = client.get(url, headers={'Authorization': 'Bearer '+token})
+response.raise_for_status()
+rows = response.json()['items']
+return rows
+`;
+    expect(redactSensitiveText(source)).toBe(source);
+    expect(redactSensitiveText(JSON.stringify({ content: source }))).toBe(JSON.stringify({ content: source }));
+  });
+  it.each(["Bearer", "Basic"])("preserves an empty quoted %s scheme only", (scheme) => {
+    const source = `headers = {"Authorization": "${scheme} " + token}`;
+    expect(redactSensitiveText(source)).toBe(source);
+  });
+  it.each([
+    `Authorization: 'Bearer real-secret'`,
+    `Authorization: "Bearer first-line\nsecond-line"`,
+    `Bearer 'actual-secret'`,
+    `Authorization: "Bearer actual"malformed-tail`,
+    `Authorization: "Bearer "malformed-tail`,
+  ])("retains credential redaction: %s", (source) => {
+    const output = redactSensitiveText(source);
+    for (const secret of ["real-secret", "first-line", "second-line", "actual-secret", "malformed-tail"]) {
+      expect(output).not.toContain(secret);
+    }
+    expect(output).toContain(REDACTED_EVENT_VALUE);
+  });
+});

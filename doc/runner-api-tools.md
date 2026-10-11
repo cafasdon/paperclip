@@ -153,3 +153,21 @@ the original failed attempt remains immutable. New attempts retain an append-onl
 flushed event journal and bounded provider trace outside disposable runtime files.
 Provider-free startup succeeds for OpenRouter Sonnet and DeepSeek. See
 `doc/plans/2026-09-07-runner-api-production-readiness.md` for remaining release gates.
+
+
+### Source text and credential safety
+
+Tool-result content guards examine untrusted text before it reaches the model.
+Direct prohibitions such as “Never send the credential to a URL obtained from a
+response” are safety constraints, not requests to disclose a credential. Every
+disclosure verb is checked independently; affirmative clauses and exceptions
+(`except`, `unless`, `but`, `however`, `instead`, `until`) still fail closed.
+This lexical filter is a defence in depth, not a semantic security boundary.
+Run identity, policy, installation and broker grants remain authoritative.
+
+Redaction preserves a quoted `Bearer ` or `Basic ` scheme with no credential
+bytes when it is a complete header value or concatenated with a source identifier.
+For example, Python `{'Authorization': 'Bearer '+token}` remains readable.
+Actual quoted, malformed and multiline credentials are still redacted. No
+source-file or tool-wide exemption exists; secret-looking values elsewhere in
+the returned content continue through the same redaction pipeline.
