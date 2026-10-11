@@ -29,6 +29,13 @@ The `codex_local` adapter runs OpenAI's Codex CLI locally. It supports session p
 
 ## Session Persistence
 
+Managed HTTP MCP gateways use `mcp_servers.<name>.http_headers` to send their
+run-scoped bearer credential. `headers` is not the Codex setting and can leave
+gateway requests unauthenticated. The adapter rewrites its marked config block
+on each run, including old blocks, while preserving unmanaged MCP entries.
+Generated and staged config files retain mode `0600` on POSIX because they
+contain credentials. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
+
 Codex uses `previous_response_id` for session continuity. The adapter serializes and restores this across heartbeats, allowing the agent to maintain conversation context.
 
 ## Skills Injection

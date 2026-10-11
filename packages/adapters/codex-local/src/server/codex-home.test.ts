@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CODEX_SYNC_ALLOWLIST,
@@ -1023,10 +1024,56 @@ describe("evaluateCodexCredentialReadiness", () => {
       const alpha = await fs.readFile(path.join(alphaHome, "config.toml"), "utf8");
       const zero = await fs.readFile(path.join(zeroHome, "config.toml"), "utf8");
       expect(alpha).toContain('[mcp_servers."alpha"]');
-      expect(alpha).toContain('Authorization = "Bearer alpha-token"');
+      expect(alpha).toContain('http_headers = { Authorization = "Bearer alpha-token" }');
+      expect(alpha).not.toMatch(/^headers\s*=/m);
       expect(zero).not.toContain("mcp_servers.");
       expect(zero).not.toContain("stale-token");
       expect(alphaHome).not.toBe(zeroHome);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates legacy headers for every managed gateway without rewriting unmanaged entries", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-migrate-"));
+    try {
+      const unmanaged = '[mcp_servers.direct]\nurl = "https://direct.example/mcp"\nhttp_headers = { "X-Custom" = "keep" }\n';
+      await fs.writeFile(path.join(root, "config.toml"), `${unmanaged}\n# BEGIN PAPERCLIP MANAGED MCP\n[mcp_servers.old]\nheaders = { Authorization = "Bearer old-token" }\n# END PAPERCLIP MANAGED MCP\n`);
+      const gateways = [
+        { name: "paperclip", endpointPath: "/api/mcp", bearerToken: "core-token" },
+        { name: "governed", endpointPath: "/api/tool-gateway/mcp", bearerToken: "tool-token" },
+      ];
+      await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways });
+      const content = await fs.readFile(path.join(root, "config.toml"), "utf8");
+      expect(content).toContain(unmanaged.trimEnd());
+      expect(content).not.toContain("old-token");
+      expect(content).not.toMatch(/^headers\s*=/m);
+      for (const gateway of gateways) {
+        expect(content).toContain(`[mcp_servers."${gateway.name}"]\nurl = "https://paperclip.example${gateway.endpointPath}"\nhttp_headers = { Authorization = "Bearer ${gateway.bearerToken}" }`);
+      }
+      // Repeated run preparation must not duplicate or change the valid block.
+      await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways });
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).toBe(content);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.env.PAPERCLIP_TEST_CODEX_CONFIG === "1")("loads managed Authorization through the real Codex config parser", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-cli-"));
+    try {
+      await writeManagedCodexMcpConfig({
+        codexHome: root,
+        apiBaseUrl: "https://paperclip.example",
+        gateways: [{ name: "paperclip", endpointPath: "/api/mcp", bearerToken: "synthetic-test-token" }],
+      });
+      // No provider login, network request, or real credential is required.
+      // The CLI's parser is the independent contract for http_headers:
+      // https://developers.openai.com/codex/config-reference/
+      const parsed = JSON.parse(execFileSync("codex", ["mcp", "get", "paperclip", "--json"], {
+        env: { ...process.env, CODEX_HOME: root }, cwd: root, encoding: "utf8", timeout: 15_000,
+      }));
+      expect(parsed.transport.http_headers).toEqual({ Authorization: "Bearer synthetic-test-token" });
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1154,7 +1201,7 @@ describe("stageCodexHomeForSync", () => {
       // and is persisted 0600 on disk.
       await fs.writeFile(
         path.join(home, "config.toml"),
-        "[mcp_servers.paperclip]\nheaders = { Authorization = \"Bearer secret-token\" }\n",
+        "[mcp_servers.paperclip]\nhttp_headers = { Authorization = \"Bearer secret-token\" }\n",
         { mode: 0o600 },
       );
       staged = await stageCodexHomeForSync(home, { runId: "run-toml-mode" });
