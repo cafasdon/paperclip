@@ -37,16 +37,19 @@ function stableSerialize(value: unknown): string {
 }
 
 function scanPromptInjection(value: unknown): string[] {
-  const text = typeof value === "string" ? value : stableSerialize(value);
+  const text = (typeof value === "string" ? value : stableSerialize(value))
+    .replace(/\\[nrt]/g, " ");
   const findings = PROMPT_INJECTION_PATTERNS
     .filter((pattern) => pattern.re.test(text))
     .map((pattern) => pattern.code);
   const exfiltration = /(?=(\b(?:exfiltrate|leak|steal|send)\b.{0,40}?\b(?:secret|token|api[-_ ]?key|credential)s?\b))/gi;
   for (const match of text.matchAll(exfiltration)) {
     const prefix = text.slice(Math.max(0, match.index - 24), match.index);
-    const suffix = text.slice(match.index + match[1].length).split(/[.;\r\n]/, 1)[0];
+    const suffix = text.slice(match.index + match[1].length);
     // A direct prohibition is not an instruction to disclose a credential.
-    // Exceptions and subsequent affirmative clauses still fail closed.
+    // Scan the remaining text conservatively for exceptions: punctuation in
+    // URLs or line wrapping must not hide a qualification. Subsequent
+    // affirmative verbs are checked independently by overlapping matches.
     const prohibited = /\b(?:never|do not|must not|should not|don't)\s+$/i.test(prefix);
     if (!prohibited || /\b(?:except|unless|but|however|instead|until)\b/i.test(suffix)) {
       findings.push("secret_exfiltration");
