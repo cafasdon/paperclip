@@ -36,6 +36,14 @@ on each run, including old blocks, while preserving unmanaged MCP entries.
 Generated and staged config files retain mode `0600` on POSIX because they
 contain credentials. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
 
+The project MCP service annotates `list_projects` and `list_project_repositories`
+with `readOnlyHint: true`. Codex 0.162.0 uses this hint to allow reads under its
+`auto` or `writes` MCP approval mode, including non-interactive runs with
+`approval_policy = "never"`. An explicit `prompt` mode still requires approval.
+Project and task creation are not marked read-only; their approval behaviour
+and all company/run authentication checks remain intact. These hints describe
+tool behaviour and do not grant additional API access.
+
 Codex uses `previous_response_id` for session continuity. The adapter serializes and restores this across heartbeats, allowing the agent to maintain conversation context.
 
 ## Skills Injection

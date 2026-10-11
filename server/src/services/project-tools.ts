@@ -9,6 +9,9 @@ export function projectToolDefinitions(workMode: string, includeTask = false) {
     (PROJECT_TOOL_NAMES.includes(tool.operationId) || includeTask && tool.operationId === "create_task")
     && tool.allowedModes.includes(workMode as "standard"),
   ).map(tool => ({ name: tool.operationId, description: tool.description,
+    ...(tool.operationId === "list_projects" || tool.operationId === "list_project_repositories"
+      ? { annotations: { readOnlyHint: true } }
+      : {}),
     inputSchema: tool.operationId === "create_project"
       ? z.toJSONSchema(createProjectSchema.extend({ idempotencyKey: z.string().min(1).max(255) }))
       : tool.inputSchema,
