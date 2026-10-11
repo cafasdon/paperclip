@@ -4,6 +4,8 @@
 
 ### Patch Changes
 
+- Scope credential-disclosure qualification checks to individual tool-result text fields, including JSON text. Duplicate MCP content wrappers no longer turn a safe prohibition into an exfiltration finding. Every field remains scanned, and other injection checks keep their existing scope.
+
 - Preserve credential-free quoted HTTP authentication schemes in source returned by tools, and distinguish direct credential-disclosure prohibitions from affirmative or exception-qualified exfiltration instructions. Existing secret-value redaction and other injection checks remain active.
 
 - Mark the project and repository listing MCP tools read-only. Mutation tools retain their approval behaviour and authenticated API checks remain unchanged.

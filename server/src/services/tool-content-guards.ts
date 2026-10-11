@@ -36,6 +36,38 @@ function stableSerialize(value: unknown): string {
   return `{${entries.join(",")}}`;
 }
 
+function* toolTextLeaves(value: unknown): Generator<string> {
+  const pending: Array<{ value: unknown; jsonDepth: number }> = [{ value, jsonDepth: 0 }];
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (typeof current.value === "string") {
+      // MCP text often contains a JSON-encoded object. Decode only containers,
+      // with a bound, so qualifications stay with their own text field.
+      if (current.jsonDepth < 8 && /^[ \t\r\n]*[\[{]/.test(current.value)) {
+        try {
+          const decoded: unknown = JSON.parse(current.value);
+          if (decoded !== null && typeof decoded === "object") {
+            // Visit source string tokens instead of the parsed object: JSON
+            // duplicate keys must not discard an earlier malicious value.
+            for (const token of current.value.matchAll(/"(?:\\.|[^"\\])*"/g)) {
+              pending.push({ value: JSON.parse(token[0]), jsonDepth: current.jsonDepth + 1 });
+            }
+            continue;
+          }
+        } catch { /* Non-JSON source text is scanned unchanged. */ }
+      }
+      yield current.value.replace(/\\[nrt]|[\r\n\t]/g, " ");
+    } else if (Array.isArray(current.value)) {
+      for (const nested of current.value) pending.push({ value: nested, jsonDepth: current.jsonDepth });
+    } else if (current.value !== null && typeof current.value === "object") {
+      for (const [key, nested] of Object.entries(current.value)) {
+        pending.push({ value: key, jsonDepth: current.jsonDepth });
+        pending.push({ value: nested, jsonDepth: current.jsonDepth });
+      }
+    }
+  }
+}
+
 function scanPromptInjection(value: unknown): string[] {
   const text = (typeof value === "string" ? value : stableSerialize(value))
     .replace(/\\[nrt]/g, " ");
@@ -43,17 +75,19 @@ function scanPromptInjection(value: unknown): string[] {
     .filter((pattern) => pattern.re.test(text))
     .map((pattern) => pattern.code);
   const exfiltration = /(?=(\b(?:exfiltrate|leak|steal|send)\b.{0,40}?\b(?:secret|token|api[-_ ]?key|credential)s?\b))/gi;
-  for (const match of text.matchAll(exfiltration)) {
-    const prefix = text.slice(Math.max(0, match.index - 24), match.index);
-    const suffix = text.slice(match.index + match[1].length);
-    // A direct prohibition is not an instruction to disclose a credential.
-    // Scan the remaining text conservatively for exceptions: punctuation in
-    // URLs or line wrapping must not hide a qualification. Subsequent
-    // affirmative verbs are checked independently by overlapping matches.
-    const prohibited = /\b(?:never|do not|must not|should not|don't)\s+$/i.test(prefix);
-    if (!prohibited || /\b(?:except|unless|but|however|instead|until)\b/i.test(suffix)) {
-      findings.push("secret_exfiltration");
-      break;
+  for (const leaf of toolTextLeaves(value)) {
+    for (const match of leaf.matchAll(exfiltration)) {
+      const prefix = leaf.slice(Math.max(0, match.index - 24), match.index);
+      const suffix = leaf.slice(match.index + match[1].length);
+      // A direct prohibition is not an instruction to disclose a credential.
+      // Scan the remaining leaf conservatively for exceptions: punctuation in
+      // URLs or line wrapping must not hide a qualification. Subsequent
+      // affirmative verbs are checked independently by overlapping matches.
+      const prohibited = /\b(?:never|do not|must not|should not|don't)\s+$/i.test(prefix);
+      if (!prohibited || /\b(?:except|unless|but|however|instead|until)\b/i.test(suffix)) {
+        findings.push("secret_exfiltration");
+        return findings;
+      }
     }
   }
   return findings;
