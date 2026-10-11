@@ -58,4 +58,3 @@ try {
  assert.equal(await fs.access(path.join(home,'forbidden.txt')).then(()=>true,()=>false),false,'read-only runtime must not write the patch');
  console.log(JSON.stringify({codexExit:code,patchRejected:true,dispatchedTools:calls,policyDenialPreserved:true,shellToolsAdvertised:false,model:'deterministic local Responses fixture',network:'loopback only'}));
 } finally {server.close();await fs.rm(home,{recursive:true,force:true});}
-
