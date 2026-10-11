@@ -15,7 +15,6 @@ const PROMPT_INJECTION_PATTERNS: Array<{ code: string; re: RegExp }> = [
   { code: "ignore_previous_instructions", re: /\bignore\b.{0,40}\b(previous|above|earlier)\b.{0,40}\binstructions?\b/i },
   { code: "reveal_system_prompt", re: /\b(reveal|print|dump|show)\b.{0,40}\b(system|developer)\b.{0,20}\b(prompt|message|instructions?)\b/i },
   { code: "instruction_hijack", re: /\b(new|updated)\b.{0,20}\b(system|developer)\b.{0,20}\b(instructions?|message)\b/i },
-  { code: "secret_exfiltration", re: /\b(exfiltrate|leak|steal|send)\b.{0,40}\b(secret|token|api[-_ ]?key|credential)s?\b/i },
 ];
 
 type ToolActionSigningSecretEnv = Partial<
@@ -39,9 +38,22 @@ function stableSerialize(value: unknown): string {
 
 function scanPromptInjection(value: unknown): string[] {
   const text = typeof value === "string" ? value : stableSerialize(value);
-  return PROMPT_INJECTION_PATTERNS
+  const findings = PROMPT_INJECTION_PATTERNS
     .filter((pattern) => pattern.re.test(text))
     .map((pattern) => pattern.code);
+  const exfiltration = /(?=(\b(?:exfiltrate|leak|steal|send)\b.{0,40}?\b(?:secret|token|api[-_ ]?key|credential)s?\b))/gi;
+  for (const match of text.matchAll(exfiltration)) {
+    const prefix = text.slice(Math.max(0, match.index - 24), match.index);
+    const suffix = text.slice(match.index + match[1].length).split(/[.;\r\n]/, 1)[0];
+    // A direct prohibition is not an instruction to disclose a credential.
+    // Exceptions and subsequent affirmative clauses still fail closed.
+    const prohibited = /\b(?:never|do not|must not|should not|don't)\s+$/i.test(prefix);
+    if (!prohibited || /\b(?:except|unless|but|however|instead|until)\b/i.test(suffix)) {
+      findings.push("secret_exfiltration");
+      break;
+    }
+  }
+  return findings;
 }
 
 export class ToolActionSigningSecretMissingError extends Error {

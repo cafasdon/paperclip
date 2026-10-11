@@ -540,6 +540,19 @@ interface AuthorizationCredentialRange {
   replacement: string;
 }
 
+// A quoted scheme with no credential bytes is source/data, not a secret.
+// Match its immediate closing delimiter, before the malformed-secret parser
+// deliberately consumes ambiguous quotes and multiline credential fragments.
+function isEmptyQuotedAuthScheme(input: string, start: number): boolean {
+  const match = /^(?:(["'])(?:Bearer|Basic)[ \t]*\1|\\(["'])(?:Bearer|Basic)[ \t]*\\\2)/i.exec(input.slice(start));
+  if (!match) return false;
+  const tail = input.slice(start + match[0].length);
+  // Preserve a complete empty header value or concatenation with a source
+  // identifier. Ambiguous attached credential tails still fail closed.
+  return /^(?:[ \t]*[,;)}\]]|[ \t]*$)/.test(tail) ||
+    /^[ \t]*\+[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*(?:[,;)}\]]|$)/.test(tail);
+}
+
 function authorizationCredentialRange(
   input: string,
   wordEnd: number,
@@ -565,6 +578,8 @@ function authorizationCredentialRange(
   if (input[valueStart] === ":" || input[valueStart] === "=") {
     valueStart = inlineWhitespaceEnd(input, valueStart + 1);
   }
+
+  if (isEmptyQuotedAuthScheme(input, valueStart)) return null;
 
   const rawValueQuote = input[valueStart];
   if (rawValueQuote === '"' || rawValueQuote === "'") {
@@ -664,6 +679,10 @@ function redactStandaloneBearerCredentials(input: string): string {
   let match: RegExpExecArray | null;
 
   while ((match = bearerWord.exec(input)) !== null) {
+    // Do not reinterpret the closing quote of a scheme-only literal as the
+    // opening quote of a credential and consume the following source lines.
+    if ((match.index > 0 && isEmptyQuotedAuthScheme(input, match.index - 1)) ||
+        (match.index > 1 && isEmptyQuotedAuthScheme(input, match.index - 2))) continue;
     const wordEnd = match.index + match[0].length;
     const credentialStart = inlineWhitespaceEnd(input, wordEnd);
     if (
@@ -973,14 +992,23 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
+function redactSecretFieldMatch(match: string, prefix: string, closingQuote: string, offset: number, input: string): string {
+  const value = match.slice(prefix.length, -closingQuote.length);
+  // Only an Authorization field may carry a credential-free scheme literal.
+  // A token/password field containing these words remains sensitive.
+  if (/^\\?["']?authorization\\?["']?\s*:/i.test(prefix) && /^(?:Bearer|Basic)[ \t]*$/i.test(value)
+      && isEmptyQuotedAuthScheme(input, offset + prefix.length - closingQuote.length)) return match;
+  return `${prefix}${REDACTED_EVENT_VALUE}${closingQuote}`;
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
     redactStandaloneBearerCredentials(redactAuthorizationCredentials(input))
-      .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
+      .replace(JSON_SECRET_FIELD_TEXT_RE, redactSecretFieldMatch)
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
-        `$1${REDACTED_EVENT_VALUE}$2`,
+        redactSecretFieldMatch,
       ),
     REDACTED_EVENT_VALUE,
   );

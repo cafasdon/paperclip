@@ -4,6 +4,8 @@
 
 ### Patch Changes
 
+- Preserve credential-free quoted HTTP authentication schemes in source returned by tools, and distinguish direct credential-disclosure prohibitions from affirmative or exception-qualified exfiltration instructions. Existing secret-value redaction and other injection checks remain active.
+
 - Mark the project and repository listing MCP tools read-only. Mutation tools retain their approval behaviour and authenticated API checks remain unchanged.
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
