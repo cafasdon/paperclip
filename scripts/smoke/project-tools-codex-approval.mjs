@@ -48,9 +48,10 @@ try {
  const code=await new Promise(r=>child.on('exit',r));clearTimeout(timer);
  assert.equal(code,0,text);
  assert.deepEqual(calls,['list_projects','list_project_repositories'],text);
- for (const callId of ['call_3','call_4']) { assert.match(String(outputs.find(item=>item.call_id===callId)?.output), /MCP tool call requires approval, but approval policy is never/); }
+ for (const callId of ['call_3','call_4']) { assert.match(JSON.stringify(outputs.find(item=>item.call_id===callId)?.output), /MCP tool call requires approval, but approval policy is never/); }
  console.log(JSON.stringify({codexExit:code,dispatchedTools:calls,mutationsDenied:true,model:'deterministic local Responses fixture',network:'loopback only'}));
 } finally {server.close();await fs.rm(home,{recursive:true,force:true});}
+
 
 
 
