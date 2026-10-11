@@ -36,6 +36,15 @@ on each run, including old blocks, while preserving unmanaged MCP entries.
 Generated and staged config files retain mode `0600` on POSIX because they
 contain credentials. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
 
+Managed same-origin `/mcp/gateways/<gatewayPublicId>` endpoints receive
+`default_tools_approval_mode = "approve"`, matching the native runner. This
+lets calls reach Paperclip's authenticated gateway, where connection grants,
+tool policies and required human approvals remain authoritative. It does not
+mark mutations read-only or change global Codex approval settings. Other
+endpoints, including native project MCP and upstream servers, retain their
+existing approval behaviour. URLs with queries, fragments or user information
+do not receive this setting.
+
 The project MCP service annotates `list_projects` and `list_project_repositories`
 with `readOnlyHint: true`. Codex 0.162.0 uses this hint to allow reads under its
 `auto` or `writes` MCP approval mode, including non-interactive runs with

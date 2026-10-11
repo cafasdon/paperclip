@@ -4,6 +4,7 @@
 
 ### Patch Changes
 
+- Delegate Codex tool approval to same-origin Paperclip policy gateway endpoints, matching the native runner. Project MCP and upstream servers retain their existing approval behaviour.
 - Write managed MCP bearer credentials with Codex's supported `http_headers` setting. Existing managed blocks are replaced on the next run; unmanaged entries remain unchanged.
 
 ## 0.3.1

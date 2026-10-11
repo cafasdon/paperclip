@@ -1079,6 +1079,28 @@ describe("evaluateCodexCredentialReadiness", () => {
     }
   });
 
+  it.each([
+    ["/mcp/gateways/company-gateway_1", true],
+    ["https://paperclip.example/mcp/gateways/company-gateway_1", true],
+    ["https://upstream.example/mcp/gateways/company-gateway_1", false],
+    ["/api/mcp", false],
+    ["/mcp/gateways/id/extra", false],
+    ["/mcp/gateways/id?redirect=elsewhere", false],
+    ["/mcp/gateways/id#fragment", false],
+    ["https://user:password@paperclip.example/mcp/gateways/id", false],
+  ])("delegates approvals only to the policy gateway: %s", async (endpointPath, approved) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-policy-"));
+    try {
+      await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example",
+        gateways: [{ name: "gateway", endpointPath, bearerToken: "synthetic" }] });
+      const config = await fs.readFile(path.join(root, "config.toml"), "utf8");
+      expect(config.includes('default_tools_approval_mode = "approve"')).toBe(approved);
+      expect(config).not.toContain("approval_policy");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("restricts permissions on an existing managed MCP config", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-mcp-config-"));
     try {

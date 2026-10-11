@@ -312,11 +312,18 @@ function buildManagedMcpBlock(input: {
       );
     }
     const url = new URL(gateway.endpointPath, input.apiBaseUrl).toString();
+    const endpoint = new URL(url);
+    const isPolicyGateway = endpoint.origin === new URL(input.apiBaseUrl).origin
+      && /^\/mcp\/gateways\/[A-Za-z0-9_-]+$/.test(endpoint.pathname)
+      && !endpoint.search && !endpoint.hash && !endpoint.username && !endpoint.password;
     lines.push(
       "",
       `[mcp_servers.${tomlString(managedName)}]`,
       `url = ${tomlString(url)}`,
       `http_headers = { Authorization = ${tomlString(`Bearer ${gateway.bearerToken}`)} }`,
+      // Only the authenticated Paperclip policy gateway owns approval here.
+      // Native project tools and upstream MCP servers keep Codex's defaults.
+      ...(isPolicyGateway ? ['default_tools_approval_mode = "approve"'] : []),
     );
   });
   lines.push(MANAGED_MCP_BLOCK_END);
