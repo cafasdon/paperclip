@@ -36,6 +36,11 @@ on each run, including old blocks, while preserving unmanaged MCP entries.
 Generated and staged config files retain mode `0600` on POSIX because they
 contain credentials. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
 
+Set `search: false` to disable Codex web search, including its cached default.
+The adapter generates this trusted setting without allowing arbitrary config
+arguments through the managed authentication guard. Omitted settings retain
+the CLI default; `search: true` retains `--search`.
+
 Managed same-origin `/mcp/gateways/<gatewayPublicId>` endpoints receive
 `default_tools_approval_mode = "approve"`, matching the native runner. This
 lets calls reach Paperclip's authenticated gateway, where connection grants,

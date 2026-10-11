@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest";
 import { buildCodexExecArgs } from "./codex-args.js";
 
 describe("buildCodexExecArgs", () => {
+  it.each([null, "existing-session"])("disables search explicitly for session %s", (resumeSessionId) => {
+    const { args } = buildCodexExecArgs({ search: false, extraArgs: ["--sandbox", "read-only"] }, { resumeSessionId });
+    expect(args).toContain('web_search="disabled"');
+    expect(args).not.toContain("--search");
+    expect(args.slice(-1)).toEqual(["-"]);
+    expect(args.indexOf('web_search="disabled"')).toBeLessThan(resumeSessionId ? args.indexOf("resume") : args.length - 1);
+  });
+
+  it.each([undefined, null, "false"])("retains search defaults for non-boolean false %s", (search) => {
+    expect(buildCodexExecArgs({ search }).args).not.toContain('web_search="disabled"');
+  });
+
   it.each([["gpt-6-astra", "ultra"], ["gpt-6.1-sol", "ultra"], ["gpt-6-sol", "ultra"], ["gpt-6-luna", "max"]])("forwards %s, its supported reasoning effort, and fast mode", (model, effort) => {
     const result = buildCodexExecArgs({
       model,
